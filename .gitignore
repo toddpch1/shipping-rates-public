@@ -1,0 +1,10 @@
+﻿# Secrets
+.env
+app/.env
+**/.env
+
+# Local databases
+prisma/dev.sqlite
+prisma/*.sqlite
+prisma/*.db
+prisma/*.db-journal
