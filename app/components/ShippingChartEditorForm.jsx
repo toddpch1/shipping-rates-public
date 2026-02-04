@@ -77,13 +77,13 @@ export function ShippingChartEditorForm({
         const nextMin =
           typeof lastMax === "number" && Number.isFinite(lastMax)
             ? Number((lastMax + 0.01).toFixed(2))
-            : 0;
+            : null;
 
         return {
           _key: crypto.randomUUID(),
           id: null,
           minValue: nextMin,
-          minValueText: formatMoney2(nextMin),
+          minValueText: nextMin == null ? "" : formatMoney2(nextMin),
           maxValue: null,
           maxValueText: "",
           rateType: "FLAT",
@@ -226,12 +226,15 @@ export function ShippingChartEditorForm({
     isActive: Boolean(isActive),
     handlingFee: Number(handlingFee ?? 0),
     tiers: tiers.map((t, index) => ({
-    minValue: Number(t.minValue ?? 0),
+    minValue:
+    t.minValue == null || t.minValue === ""
+      ? index === 0 ? 0 : null
+      : Number(t.minValue),
     maxValue: t.maxValue === null || t.maxValue === "" ? null : Number(t.maxValue),
     rateType: t.rateType,
     rateValue:
     t.rateValueText == null || String(t.rateValueText).trim() === ""
-      ? 0
+      ? (index === 0 ? 0 : null)
       : t.rateType === "PERCENT"
         ? Math.round(Number(t.rateValueText))
         : Number(t.rateValueText),
@@ -315,11 +318,30 @@ export function ShippingChartEditorForm({
                             updateTier(tier._key, { minValueText: v })
                           }
                           onBlur={() => {
-                            const n = Number(tier.minValueText);
-                            const safe = Number.isFinite(n) ? n : 0;
+                            const raw = (tier.minValueText ?? "").trim();
+
+                            // Blank stays blank for tier 2+; tier 1 defaults to 0.00
+                            if (raw === "") {
+                              if (index === 0) {
+                                updateTier(tier._key, {
+                                  minValue: 0,
+                                  minValueText: formatMoney2(0),
+                                });
+                              } else {
+                                updateTier(tier._key, {
+                                  minValue: null,
+                                  minValueText: "",
+                                });
+                              }
+                              return;
+                            }
+
+                            const n = Number(raw);
+                            const safe = Number.isFinite(n) ? n : index === 0 ? 0 : null;
+
                             updateTier(tier._key, {
                               minValue: safe,
-                              minValueText: formatMoney2(safe),
+                              minValueText: safe == null ? "" : formatMoney2(safe),
                             });
                           }}
                           autoComplete="off"
@@ -335,17 +357,33 @@ export function ShippingChartEditorForm({
                             updateTier(tier._key, { maxValueText: v })
                           }
                           onBlur={() => {
-                            const raw = tier.maxValueText ?? "";
+                            const raw = (tier.maxValueText ?? "").trim();
+
+                            // If max cleared, keep it cleared and do not auto-fill next min
                             if (raw === "") {
                               updateTier(tier._key, { maxValue: null, maxValueText: "" });
                               return;
                             }
+
                             const n = Number(raw);
                             const safe = Number.isFinite(n) ? n : null;
+
                             updateTier(tier._key, {
                               maxValue: safe,
                               maxValueText: safe == null ? "" : formatMoney2(safe),
                             });
+
+                            // Auto-fill next tier min = this max + 0.01 (only if next min is blank)
+                            if (safe != null) {
+                              const next = tiers[index + 1];
+                              if (next && String(next.minValueText ?? "").trim() === "") {
+                                const nextMin = Number((safe + 0.01).toFixed(2));
+                                updateTier(next._key, {
+                                  minValue: nextMin,
+                                  minValueText: formatMoney2(nextMin),
+                                });
+                              }
+                            }
                           }}
                           autoComplete="off"
                         />
@@ -375,29 +413,46 @@ export function ShippingChartEditorForm({
                               }
                               onBlur={() => {
                                 const raw = (tier.rateValueText ?? "").trim();
-                                  if (raw === "") {
-                                    // Keep blank for tiers that start blank (user hasn't entered anything)
-                                    updateTier(tier._key, { rateValue: null, rateValueText: "" });
-                                    return;
-                                  }
 
-                                  const n = Number(raw);
-                                  const safe = Number.isFinite(n) ? n : 0;
+                                // Blank stays blank for tier 2+; tier 1 defaults to 0
+                                if (raw === "") {
+                                  if (index === 0) {
+                                    if (tier.rateType === "PERCENT") {
+                                      updateTier(tier._key, {
+                                        rateValue: 0,
+                                        rateValueText: formatPercentWhole(0),
+                                      });
+                                    } else {
+                                      updateTier(tier._key, {
+                                        rateValue: 0,
+                                        rateValueText: formatMoney2(0),
+                                      });
+                                    }
+                                  } else {
+                                    updateTier(tier._key, { rateValue: null, rateValueText: "" });
+                                  }
+                                  return;
+                                }
+
+                                const n = Number(raw);
+                                const safe = Number.isFinite(n) ? n : index === 0 ? 0 : null;
 
                                 if (tier.rateType === "PERCENT") {
-                                  const whole = Math.round(safe);
+                                  const whole = safe == null ? null : Math.round(safe);
                                   updateTier(tier._key, {
                                     rateValue: whole,
-                                    rateValueText: formatPercentWhole(whole),
+                                    rateValueText: whole == null ? "" : formatPercentWhole(whole),
                                   });
                                   return;
                                 }
 
                                 updateTier(tier._key, {
                                   rateValue: safe,
-                                  rateValueText: formatMoney2(safe),
+                                  rateValueText: safe == null ? "" : formatMoney2(safe),
                                 });
                               }}
+
+
                               suffix={tier.rateType === "PERCENT" ? "%" : "$"}
                               autoComplete="off"
                             />
