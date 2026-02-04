@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Page } from "@shopify/polaris";
 import {
   useActionData,
@@ -48,7 +48,7 @@ export async function loader({ request, params }) {
   // Settings-driven later. Keep empty but stable for now.
   const shippingServiceOptions = [];
 
-    const uiTiers = (chart.tiers || []).map((t) => {
+  const uiTiers = (chart.tiers || []).map((t) => {
     const minValue = (t.minCents ?? 0) / 100;
     const maxValue = t.maxCents == null ? null : t.maxCents / 100;
 
@@ -81,7 +81,6 @@ export async function loader({ request, params }) {
     shippingServiceOptions,
     appBridgeApiKey,
   };
-
 }
 
 function toCentsOrNull(amount) {
@@ -214,7 +213,6 @@ export async function action({ request, params }) {
   return { ok: true };
 }
 
-
 export default function EditShippingChartPage() {
   const submit = useSubmit();
   const navigate = useNavigate();
@@ -246,12 +244,22 @@ export default function EditShippingChartPage() {
     fd.set("tiers", JSON.stringify(payload?.tiers || []));
     fd.set("handlingFee", String(payload?.handlingFee ?? 0));
 
-
     submit(fd, { method: "post" });
-
-    // tiny delay for perceived responsiveness
-    setTimeout(() => setSaving(false), 300);
   };
+
+  // stop spinner when action returns (success OR failure)
+  useEffect(() => {
+    if (actionData?.ok !== undefined) {
+      setSaving(false);
+    }
+  }, [actionData?.ok]);
+
+  // redirect back to list after successful save
+  useEffect(() => {
+    if (actionData?.ok === true) {
+      navigate(backUrl);
+    }
+  }, [actionData?.ok, navigate, backUrl]);
 
   return (
     <Page

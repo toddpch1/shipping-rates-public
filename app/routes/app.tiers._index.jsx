@@ -8,6 +8,7 @@ import {
   Button,
   ButtonGroup,
   InlineStack,
+  Box,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
@@ -81,26 +82,36 @@ export default function ShippingChartsIndex() {
   // Preserve embedded params
   const search = location.search || window.location.search || "";
 
-  const goToChart = (chartId) => {
-    navigate(`/app/tiers/${chartId}${search}`);
-  };
+  const goToChart = (chartId) => navigate(`/app/tiers/${chartId}${search}`);
+  const goCreate = () => navigate(`/app/tiers/new${search}`);
 
-  const goCreate = () => {
-    // ✅ SPA navigation (prevents Shopify iframe bounce/arrow)
-    navigate(`/app/tiers/new${search}`);
-  };
+  const resourceName = { singular: "chart", plural: "charts" };
+
+  const emptyStateMarkup = (
+    <Box padding="400">
+      <Text as="h2" variant="headingMd">
+        No shipping charts yet
+      </Text>
+      <Box paddingBlockStart="200">
+        <Text as="p" tone="subdued">
+          Create your first chart to start configuring tiered shipping rates.
+        </Text>
+      </Box>
+      {/* Intentionally no Create button here (Page primaryAction is the single Create entry point) */}
+    </Box>
+  );
 
   const rowMarkup = charts.map((chart, index) => {
     const statusBadge = chart.isActive ? (
       <Badge tone="success">Active</Badge>
     ) : (
-      <Badge tone="subdued">Inactive</Badge>
+      <Badge>Inactive</Badge>
     );
 
     return (
       <IndexTable.Row id={chart.id} key={chart.id} position={index}>
         <IndexTable.Cell>
-          <Text as="span" variant="bodyMd" fontWeight="semibold">
+          <Text variant="bodyMd" fontWeight="semibold" as="span">
             {chart.name}
           </Text>
         </IndexTable.Cell>
@@ -110,10 +121,20 @@ export default function ShippingChartsIndex() {
         <IndexTable.Cell>
           <InlineStack gap="200" align="end">
             <ButtonGroup>
-              <Button onClick={() => goToChart(chart.id)}>Edit</Button>
+              <Button
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  goToChart(chart.id);
+                }}
+              >
+                Edit
+              </Button>
 
               <Button
-                onClick={() => {
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
                   submit(
                     { intent: "toggle-active", id: chart.id },
                     { method: "post" }
@@ -125,16 +146,16 @@ export default function ShippingChartsIndex() {
 
               <Button
                 tone="critical"
-                onClick={() => {
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+
                   const ok = window.confirm(
                     `Delete "${chart.name}"?\n\nThis will permanently delete:\n• the chart\n• all tiers\n• all selectors\n\nThis cannot be undone.`
                   );
                   if (!ok) return;
 
-                  submit(
-                    { intent: "delete-chart", id: chart.id },
-                    { method: "post" }
-                  );
+                  submit({ intent: "delete-chart", id: chart.id }, { method: "post" });
                 }}
               >
                 Delete
@@ -148,34 +169,20 @@ export default function ShippingChartsIndex() {
 
   return (
     <Page
-      title="Shipping Charts"
-      primaryAction={{
-        content: "Create New Shipping Chart",
-        onAction: goCreate, // ✅ NOT url
-      }}
+      title="Shipping charts"
+      primaryAction={{ content: "Create shipping chart", onAction: goCreate }}
     >
-      {/* Zebra striping + darker header */}
-      <style>{`
-        .sr-zebra thead th { background: #f3f4f6; }
-        .sr-zebra tbody tr:nth-child(even) td { background: #f6f6f7; }
-      `}</style>
-
-      <div className="sr-zebra">
-        <Card padding="0">
-          <IndexTable
-            resourceName={{ singular: "chart", plural: "charts" }}
-            itemCount={charts.length}
-            selectable={false}
-            headings={[
-              { title: "Shipping Chart" },
-              { title: "Status" },
-              { title: "Actions" },
-            ]}
-          >
-            {rowMarkup}
-          </IndexTable>
-        </Card>
-      </div>
+      <Card padding="0">
+        <IndexTable
+          resourceName={resourceName}
+          itemCount={charts.length}
+          headings={[{ title: "Chart" }, { title: "Status" }, { title: "Actions" }]}
+          selectable={false}
+          emptyState={emptyStateMarkup}
+        >
+          {rowMarkup}
+        </IndexTable>
+      </Card>
     </Page>
   );
 }
