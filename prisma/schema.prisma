@@ -1,0 +1,120 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:dev.sqlite"
+}
+
+model Session {
+  id                  String   @id
+  shop                String
+  state               String
+  isOnline            Boolean  @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean  @default(false)
+  locale              String?
+  collaborator        Boolean? @default(false)
+  emailVerified       Boolean? @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+enum ChartBasisType {
+  MERCHANDISE_PRE_DISCOUNT
+  WEIGHT
+}
+
+enum MatchMode {
+  INCLUDE
+  EXCLUDE
+}
+
+enum SelectorType {
+  PRODUCT_TAG
+  PRODUCT_ID
+  COLLECTION_ID
+}
+
+enum TierPriceType {
+  FLAT
+  PERCENT_OF_BASIS
+}
+
+model ShippingChart {
+  id        String   @id @default(cuid())
+  shop      String
+  name      String
+  isActive  Boolean  @default(true)
+  priority  Int      @default(0)
+
+  basisType ChartBasisType @default(MERCHANDISE_PRE_DISCOUNT)
+
+  /// If true, this chart only applies when ALL shippable items match the selectors.
+  requireAllItemsMatch Boolean @default(false)
+
+    /// cap to stay under Shopify maximum (we default to 90% = 10% under max)
+  capPercentOfMax Int @default(90)
+
+  /// Chart-level handling fee (cents). Added to the computed tier rate.
+  handlingFeeCents Int @default(0)
+
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tiers     ShippingTier[]
+  selectors ShippingSelector[]
+
+  @@index([shop, isActive])
+  @@index([shop, priority])
+}
+
+model ShippingTier {
+  id        String   @id @default(cuid())
+  chartId   String
+  chart     ShippingChart @relation(fields: [chartId], references: [id], onDelete: Cascade)
+
+  name      String
+  minCents  Int      @default(0)
+  maxCents  Int?
+
+  priceType TierPriceType @default(FLAT)
+  flatPriceCents Int?
+  percentBps Int?
+
+  serviceCode String?
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([chartId, isActive])
+  @@index([chartId, sortOrder])
+}
+
+model ShippingSelector {
+  id        String   @id @default(cuid())
+  chartId   String
+  chart     ShippingChart @relation(fields: [chartId], references: [id], onDelete: Cascade)
+
+  mode      MatchMode
+  type      SelectorType
+  value     String
+
+  createdAt DateTime @default(now())
+
+  @@index([chartId, mode])
+  @@index([chartId, type])
+}
