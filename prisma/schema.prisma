@@ -68,6 +68,8 @@ model ShippingChart {
 
   /// Chart-level handling fee (cents). Added to the computed tier rate.
   handlingFeeCents Int @default(0)
+    /// Default shipping service code (used by rate engine / labels)
+  defaultServiceCode String @default("")
 
 
   createdAt DateTime @default(now())

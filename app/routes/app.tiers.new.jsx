@@ -83,6 +83,7 @@ export async function action({ request }) {
   const isActive = String(formData.get("isActive") || "true") === "true";
   const tiersJson = String(formData.get("tiers") || "[]");
   const handlingFee = String(formData.get("handlingFee") || "0");
+  const defaultServiceCode = String(formData.get("defaultServiceCode") || "");
 
   if (!name) return { ok: false, fieldErrors: { name: "Name is required" } };
 
@@ -145,6 +146,7 @@ export async function action({ request }) {
 
     const created = await prisma.shippingChart.create({
     data: {
+      defaultServiceCode,
       shop,
       name,
       isActive,
@@ -193,7 +195,7 @@ export default function CreateShippingChartPage() {
     fd.set("isActive", payload?.isActive ? "true" : "false");
     fd.set("tiers", JSON.stringify(payload?.tiers || []));
     fd.set("handlingFee", String(payload?.handlingFee ?? 0));
-
+    fd.set("defaultServiceCode", String(payload?.defaultServiceCode || ""));
     submit(fd, { method: "post" });
   };
 

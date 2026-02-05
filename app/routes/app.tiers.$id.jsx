@@ -75,7 +75,7 @@ export async function loader({ request, params }) {
       name: chart.name,
       isActive: chart.isActive,
       handlingFee: (chart.handlingFeeCents ?? 0) / 100,
-      defaultServiceCode: "", // UI-only for now
+      defaultServiceCode: chart.defaultServiceCode || "",
       tiers: uiTiers,
     },
     shippingServiceOptions,
@@ -107,7 +107,7 @@ export async function action({ request, params }) {
   const isActive = String(formData.get("isActive") || "true") === "true";
   const tiersJson = String(formData.get("tiers") || "[]");
   const handlingFee = String(formData.get("handlingFee") || "0");
-
+  const defaultServiceCode = String(formData.get("defaultServiceCode") || "");
   if (!name) return { ok: false, fieldErrors: { name: "Name is required" } };
 
   // Ensure ownership
@@ -201,6 +201,7 @@ export async function action({ request, params }) {
       data: {
         name,
         isActive,
+        defaultServiceCode,
         handlingFeeCents: toCentsOrNull(handlingFee) ?? 0,
         tiers: {
           create: tierCreates,
@@ -243,7 +244,7 @@ export default function EditShippingChartPage() {
     fd.set("isActive", payload?.isActive ? "true" : "false");
     fd.set("tiers", JSON.stringify(payload?.tiers || []));
     fd.set("handlingFee", String(payload?.handlingFee ?? 0));
-
+    fd.set("defaultServiceCode", String(payload?.defaultServiceCode || ""));
     submit(fd, { method: "post" });
   };
 

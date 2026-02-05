@@ -225,6 +225,7 @@ export function ShippingChartEditorForm({
     name: String(name || "").trim(),
     isActive: Boolean(isActive),
     handlingFee: Number(handlingFee ?? 0),
+    defaultServiceCode: String(defaultService || ""),
     tiers: tiers.map((t, index) => ({
     minValue:
     t.minValue == null || t.minValue === ""
