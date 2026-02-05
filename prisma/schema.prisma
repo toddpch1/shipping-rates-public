@@ -120,3 +120,28 @@ model ShippingSelector {
   @@index([chartId, mode])
   @@index([chartId, type])
 }
+model ShopSettings {
+  id String @id @default(cuid())
+
+  /// Shopify shop domain
+  shop String @unique
+
+  /// Shopify zone IDs this app manages (JSON array of GIDs)
+  managedZoneIdsJson String @default("[]")
+
+  /// Snapshot of zone definitions pulled from Shopify
+  zonesSnapshotJson String @default("{}")
+
+  /// Snapshot of shipping services pulled from Shopify
+  servicesSnapshotJson String @default("{}")
+
+  /// Last successful sync time
+  lastSyncedAt DateTime?
+
+  /// Last sync error message (used for Flow trigger context)
+  lastSyncError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
