@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import shopify, { sessionStorage } from "../shopify.server";
+import { sessionStorage } from "../shopify.server";
 
 async function adminGraphql(session, query, variables) {
   const apiVersion = "2025-10"; // matches ApiVersion.October25 used in shopify.server.js
@@ -68,13 +68,17 @@ async function fetchZonesSnapshot(session) {
                   name
                   countries {
                     id
-                    code
+                    code {
+                        countryCode
+                        restOfWorld
+                    }
                     name
                     provinces {
-                      code
-                      name
+                        code
+                        name
                     }
                   }
+
                 }
               }
             }
@@ -105,7 +109,9 @@ async function fetchZonesSnapshot(session) {
             name: z.name ?? "",
             countries: (z.countries ?? []).map((c) => ({
               id: c.id,
-              code: c.code, // ISO alpha-2 (or Rest-of-World enum)
+              code: c.code?.restOfWorld
+                ? "REST_OF_WORLD"
+                : c.code?.countryCode ?? null, // ISO alpha-2
               name: c.name ?? "",
               provinces: (c.provinces ?? []).map((pr) => ({
                 code: pr.code,
