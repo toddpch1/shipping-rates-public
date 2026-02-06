@@ -84,7 +84,7 @@ async function fetchZonesSnapshot(session) {
     }
   `;
 
-  const res = await adminGraphql(client.session ?? client, query);
+  const res = await adminGraphql(session, query);
   const profiles = res?.data?.deliveryProfiles?.nodes ?? [];
 
 
@@ -140,19 +140,20 @@ async function fetchServicesSnapshot(session) {
     }
   `;
 
-  const res = await adminGraphql(client.session ?? client, query);
-  const profiles = res?.data?.deliveryProfiles?.nodes ?? [];
+  const res = await adminGraphql(session, query);
 
-  return {
+  const services = res?.data?.carrierServices?.nodes ?? [];
+
+    return {
     version: 1,
     pulledAt: new Date().toISOString(),
     services: services.map((s) => ({
-      id: s.id,
-      name: s.name ?? "",
-      active: !!s.active,
-      callbackUrl: s.callbackUrl ?? "",
+        id: s.id,
+        name: s.name ?? "",
+        active: !!s.active,
+        callbackUrl: s.callbackUrl ?? "",
     })),
-  };
+    };
 }
 
 async function maybeEmitFlowZonesSyncFailed({ session, error }) {
@@ -187,10 +188,8 @@ export async function action({ request }) {
       const session = await sessionStorage.loadSession(row.id);
       if (!session) throw new Error(`Offline session missing for ${shop}`);
 
-      const client = new shopify.api.clients.Graphql({ session });
-
-      const zonesSnapshot = await fetchZonesSnapshot(client);
-      const servicesSnapshot = await fetchServicesSnapshot(client);
+      const zonesSnapshot = await fetchZonesSnapshot(session);
+      const servicesSnapshot = await fetchServicesSnapshot(session);
 
       await prisma.shopSettings.upsert({
         where: { shop },
