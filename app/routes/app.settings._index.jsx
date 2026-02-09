@@ -1,5 +1,6 @@
 // app/routes/app.settings._index.jsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import crypto from "node:crypto";
 import {
   Page,
   Card,
@@ -9,16 +10,28 @@ import {
   BlockStack,
   Box,
   Modal,
-  ResourceList,
-  ResourceItem,
   Badge,
   Divider,
   Icon,
   Collapsible,
-  ButtonGroup,
-  } from "@shopify/polaris";
-import { ClockIcon } from "@shopify/polaris-icons";
-import { useActionData, useLoaderData, useLocation, useNavigate, useSubmit } from "react-router";
+  Checkbox,
+  TextField,
+  Scrollable,
+  InlineGrid,
+} from "@shopify/polaris";
+import {
+  ClockIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  SearchIcon,
+} from "@shopify/polaris-icons";
+import {
+  useActionData,
+  useLoaderData,
+  useLocation,
+  useNavigate,
+  useSubmit,
+} from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
@@ -31,80 +44,313 @@ function safeJsonParse(str, fallback) {
   }
 }
 
-/**
- * Best-effort extraction of zones from whatever shape we have stored.
- * We intentionally keep this forgiving because the zones snapshot query
- * is still evolving (and there’s a known selection mismatch issue).
- */
-function extractZones(zonesSnapshot) {
-  if (!zonesSnapshot) return [];
-
-  // Preferred normalized shape (if/when we store it like this)
-  if (Array.isArray(zonesSnapshot.zones)) {
-    return zonesSnapshot.zones
-      .map((z) => ({
-        id: String(z?.id || ""),
-        name: String(z?.name || "Untitled zone"),
-        countries: Array.isArray(z?.countries) ? z.countries : [],
-      }))
-      .filter((z) => z.id);
-  }
-
-  // Fallback: try a couple common “GraphQL response-ish” shapes
-  const maybeZones =
-    zonesSnapshot?.data?.deliveryProfiles?.nodes ||
-    zonesSnapshot?.data?.deliveryProfile?.zones ||
-    zonesSnapshot?.data?.zones ||
-    zonesSnapshot?.zones;
-
-  if (Array.isArray(maybeZones)) {
-    return maybeZones
-    .map((z) => ({
-      id: String(z?.id || z?.gid || ""),
-      name: String(z?.name || z?.title || "Untitled zone"),
-      countries: Array.isArray(z?.countries) ? z.countries : (Array.isArray(z?.locations) ? z.locations : []),
-    }))
-      .filter((z) => z.id);
-  }
-
-  return [];
+function formatUpdatedLabel(dt) {
+  if (!dt) return "Zones last updated on: Not synced yet";
+  const d = new Date(dt);
+  if (Number.isNaN(d.getTime())) return "Zones last updated on: Not synced yet";
+  return `Zones last updated on: ${d.toLocaleString()}`;
 }
 
-function extractServices(servicesSnapshot) {
-  if (!servicesSnapshot) return [];
+function stableHash(obj) {
+  const json = JSON.stringify(obj);
+  return crypto.createHash("sha256").update(json).digest("hex");
+}
 
-  // Preferred normalized shape
-  if (Array.isArray(servicesSnapshot.services)) {
-    return servicesSnapshot.services
-      .map((s) => ({
-        code: String(s?.code || ""),
-        name: String(s?.name || s?.title || s?.code || "Service"),
-        carrier: String(s?.carrier || ""),
-      }))
-      .filter((s) => s.code);
+/**
+ * We persist granular selection here:
+ * ShopSettings.managedZoneConfigJson
+ *
+ * Shape:
+ * {
+ *   groups: {
+ *     northAmerica: {
+ *       countries: {
+ *         US: { provinces: ["CO","CA", ...] }, // explicit list
+ *         CA: { provinces: ["AB","BC", ...] }, // explicit list
+ *         MX: { provinces: ["CMX", ...] } or { selected: true } // if no provinces returned
+ *       }
+ *     },
+ *     international: {
+ *       countries: {
+ *         GB: { selected: true },
+ *         AU: { selected: true },
+ *         ...
+ *       }
+ *     }
+ *   }
+ * }
+ *
+ * NOTE: “Select all” works by filling explicit provinces list when we have provinces,
+ * otherwise we treat it as a single “All of Country” checkbox inside the country expand.
+ */
+
+function getDefaultConfig() {
+  return { groups: { northAmerica: { countries: {} }, international: { countries: {} } } };
+}
+
+function normalizeConfig(raw) {
+  const cfg = raw && typeof raw === "object" ? raw : getDefaultConfig();
+  const groups = cfg.groups && typeof cfg.groups === "object" ? cfg.groups : {};
+  const na =
+    groups.northAmerica?.countries && typeof groups.northAmerica.countries === "object"
+      ? groups.northAmerica.countries
+      : {};
+  const intl =
+    groups.international?.countries && typeof groups.international.countries === "object"
+      ? groups.international.countries
+      : {};
+  return { groups: { northAmerica: { countries: na }, international: { countries: intl } } };
+}
+
+function getCountryDisplayName(code, countriesByCode) {
+  const c = countriesByCode?.[code];
+  return c?.name || code;
+}
+
+function getCountryRegions(code, countriesByCode) {
+  const c = countriesByCode?.[code];
+  const provinces = Array.isArray(c?.provinces) ? c.provinces : [];
+  return provinces.map((p) => ({ code: p.code, name: p.name }));
+}
+
+/**
+ * Build a { [countryCode]: { name, provinces:[{code,name}] } } map from deliveryProfiles.
+ * This keeps the province list accurate (no hardcoding).
+ */
+function extractCountriesFromDeliveryProfilesSnapshot(snapshot) {
+  const out = {};
+
+  // We store the raw graphql response-ish structure in zonesSnapshotJson.
+  // This extractor is defensive so schema changes don’t hard-break the UI.
+  const profiles =
+    snapshot?.data?.deliveryProfiles?.edges?.map((e) => e?.node) ||
+    snapshot?.data?.deliveryProfiles?.nodes ||
+    snapshot?.deliveryProfiles?.edges?.map((e) => e?.node) ||
+    snapshot?.deliveryProfiles?.nodes ||
+    [];
+
+  for (const p of profiles) {
+    const plgs = p?.profileLocationGroups || [];
+    for (const plg of plgs) {
+      // Option A: Shopify query includes countriesInAnyZone (some community examples do)
+      const ciaz = plg?.countriesInAnyZone || [];
+      for (const entry of ciaz) {
+        const country = entry?.country;
+        const countryCode = country?.code?.countryCode;
+        if (!countryCode) continue;
+
+        if (!out[countryCode]) out[countryCode] = { name: country?.name || countryCode, provinces: [] };
+
+        const provs = Array.isArray(entry?.provinces) ? entry.provinces : [];
+        for (const pr of provs) {
+          if (!pr?.code) continue;
+          out[countryCode].provinces.push({ code: pr.code, name: pr.name || pr.code });
+        }
+      }
+
+      // Option B: Shopify query includes locationGroupZones.zone.countries[].provinces[] (official docs example)
+      const lgzEdges = plg?.locationGroupZones?.edges || [];
+      for (const lgzEdge of lgzEdges) {
+        const zone = lgzEdge?.node?.zone;
+        const countries = zone?.countries || [];
+        for (const c of countries) {
+          const countryCode = c?.code?.countryCode;
+          if (!countryCode) continue;
+
+          if (!out[countryCode]) out[countryCode] = { name: c?.name || countryCode, provinces: [] };
+
+          const provs = Array.isArray(c?.provinces) ? c.provinces : [];
+          for (const pr of provs) {
+            if (!pr?.code) continue;
+            out[countryCode].provinces.push({ code: pr.code, name: pr.name || pr.code });
+          }
+        }
+      }
+    }
   }
 
-  // Fallback shapes
-  const maybe =
-    servicesSnapshot?.data?.carrierServices?.nodes ||
-    servicesSnapshot?.data?.shippingServices ||
-    servicesSnapshot?.services;
-
-  if (Array.isArray(maybe)) {
-    return maybe
-      .map((s) => ({
-        code: String(s?.code || s?.serviceCode || s?.handle || s?.id || ""),
-        name: String(s?.name || s?.title || s?.code || "Service"),
-        carrier: String(s?.carrier || ""),
-      }))
-      .filter((s) => s.code);
+  // Dedupe + sort provinces for stable UI/digest
+  for (const cc of Object.keys(out)) {
+    const seen = new Set();
+    out[cc].provinces = (out[cc].provinces || [])
+      .filter((p) => {
+        const k = `${p.code}|${p.name}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      })
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
   }
 
-  return [];
+  return out;
+}
+
+/**
+ * Markets digest: if markets change, we want to force a sync.
+ * Markets requires read_markets. If that scope isn’t present yet, this will fail
+ * and we’ll fall back to zone-based picker options.
+ */
+async function fetchMarketsDigestAndCountryCodes(admin) {
+  const query = `#graphql
+    query MarketsForZonePicker {
+      markets(first: 250, query: "status:ACTIVE") {
+        nodes {
+          id
+          name
+          regions(first: 250) {
+            nodes {
+              __typename
+              name
+              ... on MarketRegionCountry { code }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await admin.graphql(query);
+  const json = await res.json();
+
+  if (json?.errors?.length) {
+    throw new Error(json.errors.map((e) => e.message).join("; "));
+  }
+
+  const markets = json?.data?.markets?.nodes || [];
+  const countryCodes = new Set();
+
+  // We treat “market includes a province” as “market includes that country”
+  for (const m of markets) {
+    const regions = m?.regions?.nodes || [];
+    for (const r of regions) {
+      if (r?.__typename === "MarketRegionCountry" && r?.code) countryCodes.add(r.code);
+      if (r?.__typename === "MarketRegionProvince" && r?.country?.code) countryCodes.add(r.country.code);
+    }
+  }
+
+  // Stable digest input
+  const digestInput = {
+    markets: markets
+      .map((m) => ({
+        id: m.id,
+        name: m.name,
+        regions: (m?.regions?.nodes || [])
+          .map((r) => ({
+            t: r.__typename,
+            name: r.name,
+            code: r.code || null,
+            country: r?.country?.code || null,
+          }))
+          .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+      }))
+      .sort((a, b) => String(a.id).localeCompare(String(b.id))),
+  };
+
+  return { digest: stableHash(digestInput), marketCountryCodes: Array.from(countryCodes).sort() };
+}
+
+/**
+ * Full sync: zones + services snapshot.
+ * This uses deliveryProfiles (Shipping & fulfillment) and is the “checkout truth”.
+ * Official docs show deliveryProfiles can return zones/countries/provinces. :contentReference[oaicite:1]{index=1}
+ */
+async function syncShippingConfig(admin) {
+  const query = `#graphql
+    query DeliveryZoneList {
+      deliveryProfiles(first: 50) {
+        edges {
+          node {
+            id
+            name
+            profileLocationGroups {
+              locationGroup { id }
+              locationGroupZones(first: 250) {
+                edges {
+                  node {
+                    zone {
+                      id
+                      name
+                      countries {
+                        name
+                        code {
+                          countryCode
+                          restOfWorld
+                        }
+                        provinces {
+                          name
+                          code
+                        }
+                      }
+                    }
+                    methodDefinitions(first: 250) {
+                      edges {
+                        node {
+                          id
+                          active
+                          name
+                          description
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const res = await admin.graphql(query);
+  const json = await res.json();
+
+  if (json?.errors?.length) {
+    throw new Error(json.errors.map((e) => e.message).join("; "));
+  }
+
+  // We store the full response for now; UI code extracts defensively.
+  // You already have servicesSnapshotJson in the DB, but we keep it simple:
+  // - zonesSnapshotJson: full json
+  // - servicesSnapshotJson: derived minimal list for later service picker
+  const services = [];
+  const profiles = json?.data?.deliveryProfiles?.edges || [];
+  for (const pEdge of profiles) {
+    const plgs = pEdge?.node?.profileLocationGroups || [];
+    for (const plg of plgs) {
+      const lgzEdges = plg?.locationGroupZones?.edges || [];
+      for (const lgzEdge of lgzEdges) {
+        const mdEdges = lgzEdge?.node?.methodDefinitions?.edges || [];
+        for (const mdEdge of mdEdges) {
+          const md = mdEdge?.node;
+          if (!md?.id) continue;
+          services.push({
+            id: md.id,
+            name: md.name || md.description || "Shipping service",
+            active: !!md.active,
+            description: md.description || null,
+          });
+        }
+      }
+    }
+  }
+
+  // Dedupe services
+  const seen = new Set();
+  const servicesDeduped = services.filter((s) => {
+    if (seen.has(s.id)) return false;
+    seen.add(s.id);
+    return true;
+  });
+
+  return {
+    zonesSnapshot: json,
+    servicesSnapshot: { services: servicesDeduped },
+  };
 }
 
 export async function loader({ request }) {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const shop = session.shop;
 
   const settings = await prisma.shopSettings.upsert({
@@ -112,6 +358,97 @@ export async function loader({ request }) {
     update: {},
     create: { shop },
   });
+
+  // We store a tiny meta object inside zonesSnapshotJson so we can detect Markets changes
+  const existingZonesSnapshot = safeJsonParse(settings?.zonesSnapshotJson, null);
+  const existingMeta = existingZonesSnapshot?._meta || {};
+  const existingMarketsDigest = existingMeta?.marketsDigest || null;
+
+  // Throttle forced sync so refresh spam doesn’t hammer Shopify
+  const lastSyncedAt = settings?.lastSyncedAt ? new Date(settings.lastSyncedAt).getTime() : 0;
+  const now = Date.now();
+  const THROTTLE_MS = 2 * 60 * 1000; // 2 minutes
+
+  let marketCountryCodes = null;
+  let marketsDigest = null;
+  let marketsError = null;
+
+  // 1) Try Markets digest (best UX, “truth is Markets”). Requires read_markets. :contentReference[oaicite:2]{index=2}
+  try {
+    const markets = await fetchMarketsDigestAndCountryCodes(admin);
+    marketsDigest = markets.digest;
+    marketCountryCodes = markets.marketCountryCodes;
+  } catch (e) {
+    marketsError = e instanceof Error ? e.message : String(e);
+  }
+
+  // 2) If markets changed, force a sync (zones/services) immediately (throttled)
+  const shouldForceSync =
+    marketsDigest &&
+    existingMarketsDigest &&
+    marketsDigest !== existingMarketsDigest &&
+    now - lastSyncedAt > THROTTLE_MS;
+
+  if (shouldForceSync || (!settings?.zonesSnapshotJson && now - lastSyncedAt > 5000)) {
+    try {
+      const { zonesSnapshot, servicesSnapshot } = await syncShippingConfig(admin);
+
+      // Attach meta (markets digest + codes) to zones snapshot for the picker
+      const withMeta = {
+        ...zonesSnapshot,
+        _meta: {
+          marketsDigest: marketsDigest || null,
+          marketCountryCodes: marketCountryCodes || null,
+          marketsError: marketsError || null,
+          updatedAtIso: new Date().toISOString(),
+        },
+      };
+
+      await prisma.shopSettings.update({
+        where: { shop },
+        data: {
+          zonesSnapshotJson: JSON.stringify(withMeta),
+          servicesSnapshotJson: JSON.stringify(servicesSnapshot),
+          lastSyncedAt: new Date(),
+          lastSyncError: null,
+        },
+      });
+
+      const updated = await prisma.shopSettings.findUnique({ where: { shop } });
+      return { settings: updated };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await prisma.shopSettings.update({
+        where: { shop },
+        data: { lastSyncError: msg },
+      });
+      const updated = await prisma.shopSettings.findUnique({ where: { shop } });
+      return { settings: updated };
+    }
+  }
+
+  // If we didn’t sync, still persist markets meta if we have it and there’s already a snapshot
+  if (settings?.zonesSnapshotJson && (marketsDigest || marketsError)) {
+    const nextSnapshot = existingZonesSnapshot || {};
+    const nextMeta = {
+      ...(nextSnapshot._meta || {}),
+      marketsDigest: marketsDigest || nextSnapshot?._meta?.marketsDigest || null,
+      marketCountryCodes: marketCountryCodes || nextSnapshot?._meta?.marketCountryCodes || null,
+      marketsError: marketsError || null,
+    };
+
+    // Only write if it changed materially
+    const changed =
+      JSON.stringify(nextMeta) !== JSON.stringify(existingMeta || {});
+    if (changed) {
+      await prisma.shopSettings.update({
+        where: { shop },
+        data: { zonesSnapshotJson: JSON.stringify({ ...nextSnapshot, _meta: nextMeta }) },
+      });
+      const updated = await prisma.shopSettings.findUnique({ where: { shop } });
+      return { settings: updated };
+    }
+  }
 
   return { settings };
 }
@@ -122,26 +459,21 @@ export async function action({ request }) {
 
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
+  if (intent !== "save") return { ok: false, error: "Unknown intent" };
 
-  if (intent !== "save") {
-    return { ok: false, error: "Unknown intent" };
-  }
+  const managedZoneConfigJson = String(formData.get("managedZoneConfigJson") || "{}");
 
-  const managedZoneIdsJson = String(formData.get("managedZoneIdsJson") || "[]");
-
-  // Validate JSON string (must be an array)
-  let parsed = [];
+  let parsed = getDefaultConfig();
   try {
-    parsed = JSON.parse(managedZoneIdsJson);
-    if (!Array.isArray(parsed)) parsed = [];
+    parsed = normalizeConfig(JSON.parse(managedZoneConfigJson));
   } catch {
-    parsed = [];
+    parsed = getDefaultConfig();
   }
 
   await prisma.shopSettings.update({
     where: { shop },
     data: {
-      managedZoneIdsJson: JSON.stringify(parsed),
+      managedZoneConfigJson: JSON.stringify(parsed),
     },
   });
 
@@ -154,92 +486,433 @@ export default function SettingsIndex() {
   const submit = useSubmit();
   const navigate = useNavigate();
   const location = useLocation();
-
-  const search = location.search || (typeof window !== "undefined" ? window.location.search : "") || "";
+  const search = location.search || "";
 
   const [saving, setSaving] = useState(false);
   const [zoneModalOpen, setZoneModalOpen] = useState(false);
-  const [expandedZoneIds, setExpandedZoneIds] = useState(() => new Set());
 
-  const zonesSnapshot = useMemo(
-    () => safeJsonParse(settings?.zonesSnapshotJson, {}),
-    [settings?.zonesSnapshotJson],
-  );
-  const servicesSnapshot = useMemo(
-    () => safeJsonParse(settings?.servicesSnapshotJson, {}),
-    [settings?.servicesSnapshotJson],
+  const zonesLastUpdatedLabel = useMemo(
+    () => formatUpdatedLabel(settings?.lastSyncedAt),
+    [settings?.lastSyncedAt],
   );
 
-  const zones = useMemo(() => extractZones(zonesSnapshot), [zonesSnapshot]);
-  const services = useMemo(() => extractServices(servicesSnapshot), [servicesSnapshot]);
-  const zonesLastUpdatedLabel = useMemo(() => {
-    // Prefer zones snapshot freshness if present; fallback to lastSyncedAt
-    const dt = settings?.lastSyncedAt ? new Date(settings.lastSyncedAt) : null;
-    if (!dt || Number.isNaN(dt.getTime())) return "Zones last updated on: Not synced yet";
-    return `Zones last updated on: ${dt.toLocaleString()}`;
-  }, [settings?.lastSyncedAt]);
+  const savedConfig = useMemo(() => {
+    const raw = safeJsonParse(settings?.managedZoneConfigJson, getDefaultConfig());
+    return normalizeConfig(raw);
+  }, [settings?.managedZoneConfigJson]);
 
-  const managedZoneIds = useMemo(() => {
-    const arr = safeJsonParse(settings?.managedZoneIdsJson, []);
-    return Array.isArray(arr) ? arr.map(String) : [];
-  }, [settings?.managedZoneIdsJson]);
+  const [draftConfig, setDraftConfig] = useState(savedConfig);
 
-  const [draftManagedZoneIds, setDraftManagedZoneIds] = useState(managedZoneIds);
+  const [expandedGroups, setExpandedGroups] = useState(() => new Set());
+  const [expandedCountries, setExpandedCountries] = useState(() => new Set());
+  const [searchQuery, setSearchQuery] = useState("");
 
-  // Keep draft in sync if loader changes (e.g., after save)
+  useEffect(() => setDraftConfig(savedConfig), [JSON.stringify(savedConfig)]);
   useEffect(() => {
-    setDraftManagedZoneIds(managedZoneIds);
-  }, [managedZoneIds.join("|")]);
-
-  useEffect(() => {
-    if (actionData?.ok !== undefined) {
-      setSaving(false);
-    }
+    if (actionData?.ok !== undefined) setSaving(false);
   }, [actionData?.ok]);
 
-  const selectedZones = useMemo(() => {
-    const set = new Set(draftManagedZoneIds);
-    return zones.filter((z) => set.has(z.id));
-  }, [zones, draftManagedZoneIds]);
+  // Build country/province data from zonesSnapshotJson (accurate, no hardcoding)
+  const zonesSnapshot = useMemo(
+    () => safeJsonParse(settings?.zonesSnapshotJson, null),
+    [settings?.zonesSnapshotJson],
+  );
 
-  const toggleZone = (zoneId) => {
-    setDraftManagedZoneIds((prev) => {
-      const set = new Set(prev.map(String));
-      if (set.has(String(zoneId))) set.delete(String(zoneId));
-      else set.add(String(zoneId));
-      return Array.from(set);
+  const zonesCountriesByCode = useMemo(() => {
+    return extractCountriesFromDeliveryProfilesSnapshot(zonesSnapshot || {});
+  }, [zonesSnapshot]);
+
+  // Markets filter (truth = Markets). If markets scope isn’t available yet, this may be null.
+  const marketCountryCodes = useMemo(() => {
+    const meta = zonesSnapshot?._meta || {};
+    const codes = meta?.marketCountryCodes;
+    return Array.isArray(codes) ? codes : null;
+  }, [zonesSnapshot]);
+
+  const availableCountryCodes = useMemo(() => {
+    const zoneCodes = Object.keys(zonesCountriesByCode || {}).sort();
+    if (marketCountryCodes && marketCountryCodes.length) {
+      // Only show countries that are in markets AND in zones snapshot (so we can list provinces)
+      const allowed = new Set(marketCountryCodes);
+      return zoneCodes.filter((cc) => allowed.has(cc));
+    }
+    // Fallback if Markets isn’t available yet
+    return zoneCodes;
+  }, [zonesCountriesByCode, marketCountryCodes]);
+
+  const NORTH_AMERICA_SET = new Set(["US", "CA", "MX"]);
+
+  const northAmericaCountryCodes = useMemo(() => {
+    return availableCountryCodes.filter((cc) => NORTH_AMERICA_SET.has(cc));
+  }, [availableCountryCodes]);
+
+  const internationalCountryCodes = useMemo(() => {
+    return availableCountryCodes.filter((cc) => !NORTH_AMERICA_SET.has(cc));
+  }, [availableCountryCodes]);
+
+  const toggleGroup = useCallback((groupKey) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      const k = String(groupKey);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }, []);
+
+  const toggleCountryExpand = useCallback((groupKey, countryCode) => {
+    setExpandedCountries((prev) => {
+      const next = new Set(prev);
+      const k = `${groupKey}:${countryCode}`;
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }, []);
+
+  const isGroupExpanded = (groupKey) => expandedGroups.has(String(groupKey));
+  const isCountryExpanded = (groupKey, countryCode) => expandedCountries.has(`${groupKey}:${countryCode}`);
+
+  const matchesSearch = (text) => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    return String(text || "").toLowerCase().includes(q);
+  };
+
+  const getCountryEntry = (groupKey, countryCode) => {
+    const countries = draftConfig.groups[groupKey].countries || {};
+    return countries[countryCode] || null;
+  };
+
+  const setCountryEntry = (groupKey, countryCode, entryOrNull) => {
+    setDraftConfig((prev) => {
+      const next = JSON.parse(JSON.stringify(prev));
+      const countries = next.groups[groupKey].countries || {};
+      if (entryOrNull === null) {
+        delete countries[countryCode];
+      } else {
+        countries[countryCode] = entryOrNull;
+      }
+      next.groups[groupKey].countries = countries;
+      return next;
     });
   };
-  const isZoneExpanded = (zoneId) => expandedZoneIds.has(String(zoneId));
-  const toggleZoneExpanded = (zoneId) => {
-    setExpandedZoneIds((prev) => {
+
+  const selectAllInCountry = (groupKey, countryCode) => {
+    const regions = getCountryRegions(countryCode, zonesCountriesByCode);
+    if (regions.length === 0) {
+      // No provinces returned; represent selection as selected=true
+      setCountryEntry(groupKey, countryCode, { selected: true });
+      return;
+    }
+    setCountryEntry(groupKey, countryCode, { provinces: regions.map((r) => r.code) });
+  };
+
+  const clearAllInCountry = (groupKey, countryCode) => {
+    setCountryEntry(groupKey, countryCode, null);
+  };
+
+  const toggleRegion = (groupKey, countryCode, regionCode, checked) => {
+    const regions = getCountryRegions(countryCode, zonesCountriesByCode);
+    if (regions.length === 0) {
+      // Only “All of Country” exists
+      if (checked) setCountryEntry(groupKey, countryCode, { selected: true });
+      else setCountryEntry(groupKey, countryCode, null);
+      return;
+    }
+
+    const entry = getCountryEntry(groupKey, countryCode);
+    const current = new Set(Array.isArray(entry?.provinces) ? entry.provinces.map(String) : []);
+    if (checked) current.add(String(regionCode));
+    else current.delete(String(regionCode));
+
+    if (current.size === 0) {
+      setCountryEntry(groupKey, countryCode, null);
+      return;
+    }
+    setCountryEntry(groupKey, countryCode, { provinces: Array.from(current) });
+  };
+
+  const countryCounts = (groupKey, countryCode) => {
+    const regions = getCountryRegions(countryCode, zonesCountriesByCode);
+    const entry = getCountryEntry(groupKey, countryCode);
+
+    if (regions.length === 0) {
+      const selected = entry?.selected ? 1 : 0;
+      return { selected, total: 1, label: selected ? "Selected" : "" };
+    }
+
+    const selected = Array.isArray(entry?.provinces) ? entry.provinces.length : 0;
+    const total = regions.length;
+    return { selected, total, label: `${selected} of ${total} states/provinces` };
+  };
+
+  const groupSummaryCounts = (groupKey, countryCodes) => {
+    let selected = 0;
+    let total = 0;
+
+    for (const cc of countryCodes) {
+      const regions = getCountryRegions(cc, zonesCountriesByCode);
+      const entry = getCountryEntry(groupKey, cc);
+
+      if (regions.length === 0) {
+        total += 1;
+        if (entry?.selected) selected += 1;
+      } else {
+        total += regions.length;
+        selected += Array.isArray(entry?.provinces) ? entry.provinces.length : 0;
+      }
+    }
+
+    return { selected, total, label: `${selected} of ${total} states/provinces` };
+  };
+
+  const onCancel = () => navigate(`/app/tiers${search}`);
+  const onSave = () => {
+    setSaving(true);
+    const fd = new FormData();
+    fd.set("intent", "save");
+    fd.set("managedZoneConfigJson", JSON.stringify(draftConfig));
+    submit(fd, { method: "post" });
+  };
+
+  const zonesButtonLabel =
+    Object.keys(draftConfig.groups.northAmerica.countries || {}).length ||
+    Object.keys(draftConfig.groups.international.countries || {}).length
+      ? "Edit Zones"
+      : "Select Shipping Zones";
+
+  // Main page display list (expandable summary)
+  const [expandedMain, setExpandedMain] = useState(() => new Set());
+  const toggleMain = (key) => {
+    setExpandedMain((prev) => {
       const next = new Set(prev);
-      const key = String(zoneId);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
     });
   };
-  const onCancel = () => {
-    navigate(`/app/tiers${search}`);
+
+  const renderSelectedGroupSummary = (groupKey, title, countryCodes) => {
+    const hasAny = Object.keys(draftConfig.groups[groupKey].countries || {}).length > 0;
+    if (!hasAny) return null;
+
+    const expanded = expandedMain.has(groupKey);
+    const summary = groupSummaryCounts(groupKey, countryCodes);
+
+    return (
+      <Box key={groupKey}>
+        <InlineStack align="space-between" blockAlign="center">
+          <InlineStack gap="150" blockAlign="center">
+            <Button variant="tertiary" onClick={() => toggleMain(groupKey)}>
+              <Icon source={expanded ? ChevronUpIcon : ChevronDownIcon} />
+            </Button>
+            <Text as="span" variant="bodyMd">{title}</Text>
+            <Badge tone="success">Managed</Badge>
+          </InlineStack>
+          <Text as="span" variant="bodySm" tone="subdued">{summary.label}</Text>
+        </InlineStack>
+
+        <Collapsible open={expanded}>
+          <Box paddingBlockStart="150" paddingInlineStart="400">
+            <BlockStack gap="150">
+              {countryCodes.map((cc) => {
+                const entry = getCountryEntry(groupKey, cc);
+                if (!entry) return null;
+
+                const regions = getCountryRegions(cc, zonesCountriesByCode);
+                const counts = countryCounts(groupKey, cc);
+
+                return (
+                  <Box key={`${groupKey}-${cc}`}>
+                    <Text as="p" variant="bodySm">
+                      • {getCountryDisplayName(cc, zonesCountriesByCode)}{" "}
+                      {regions.length ? (
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          ({Array.isArray(entry?.provinces) ? entry.provinces.join(", ") : ""})
+                        </Text>
+                      ) : (
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          (selected)
+                        </Text>
+                      )}
+                    </Text>
+                    {regions.length ? (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        {counts.label}
+                      </Text>
+                    ) : null}
+                  </Box>
+                );
+              })}
+            </BlockStack>
+          </Box>
+        </Collapsible>
+      </Box>
+    );
   };
 
-  const onSave = () => {
-    setSaving(true);
-    const fd = new FormData();
-    fd.set("intent", "save");
-    fd.set("managedZoneIdsJson", JSON.stringify(draftManagedZoneIds));
-    submit(fd, { method: "post" });
-  };
+  const renderGroupPicker = (groupKey, title, countryCodes) => {
+    const expanded = isGroupExpanded(groupKey);
+    const summary = groupSummaryCounts(groupKey, countryCodes);
 
-  const zonesButtonLabel = draftManagedZoneIds.length ? "Edit Zones" : "Select Shipping Zones";
+    // Hide if search matches nothing
+    const groupMatches =
+      matchesSearch(title) ||
+      countryCodes.some((cc) => matchesSearch(getCountryDisplayName(cc, zonesCountriesByCode)));
+
+    if (!groupMatches && searchQuery.trim()) return null;
+
+    return (
+      <Box borderWidth="025" borderColor="border" borderRadius="200">
+        {/* Header row: title + summary inline, chevron at end */}
+        <Box padding="200">
+          <InlineGrid columns={["1fr", "auto"]} gap="200" alignItems="center">
+            <InlineStack gap="200" blockAlign="center">
+              <Text as="span" variant="bodyMd" fontWeight="semibold">
+                {title}
+              </Text>
+              <Text as="span" variant="bodySm" tone="subdued">
+                {summary.label}
+              </Text>
+            </InlineStack>
+
+            <Button
+              variant="tertiary"
+              onClick={() => toggleGroup(groupKey)}
+              accessibilityLabel={`Toggle ${title}`}
+            >
+              <Icon source={expanded ? ChevronUpIcon : ChevronDownIcon} />
+            </Button>
+          </InlineGrid>
+        </Box>
+
+        <Collapsible open={expanded}>
+          <Divider />
+          <Box padding="200">
+            <BlockStack gap="150">
+              {countryCodes.map((cc) => {
+                const countryName = getCountryDisplayName(cc, zonesCountriesByCode);
+                const regions = getCountryRegions(cc, zonesCountriesByCode);
+                const entry = getCountryEntry(groupKey, cc);
+                const counts = countryCounts(groupKey, cc);
+                const cExpanded = isCountryExpanded(groupKey, cc);
+
+                const matches =
+                  matchesSearch(countryName) ||
+                  (regions.length ? regions.some((r) => matchesSearch(r.name)) : false);
+                if (!matches) return null;
+
+                return (
+                  <Box key={`${groupKey}-${cc}`} borderWidth="025" borderColor="border" borderRadius="200">
+                    {/* Country row: NO checkbox here (per your requirement). Click chevron to expand. */}
+                    <Box padding="200">
+                      <InlineGrid columns={["1fr", "auto"]} gap="200" alignItems="center">
+                        <InlineStack gap="200" blockAlign="center">
+                          <Text as="span" variant="bodyMd">{countryName}</Text>
+                          <Text as="span" variant="bodySm" tone="subdued">
+                            {counts.label || (entry ? "Selected" : "")}
+                          </Text>
+                        </InlineStack>
+
+                        <Button
+                          variant="tertiary"
+                          onClick={() => toggleCountryExpand(groupKey, cc)}
+                          accessibilityLabel={`Toggle ${countryName}`}
+                        >
+                          <Icon source={cExpanded ? ChevronUpIcon : ChevronDownIcon} />
+                        </Button>
+                      </InlineGrid>
+                    </Box>
+
+                    <Collapsible open={cExpanded}>
+                      <Divider />
+                      <Box padding="200">
+                        <BlockStack gap="150">
+                          {/* Select all row (checkbox starts here, not at country row) */}
+                          <InlineGrid columns={["auto", "1fr"]} gap="200" alignItems="center">
+                            <Checkbox
+                              label=""
+                              checked={
+                                regions.length
+                                  ? Array.isArray(entry?.provinces) && entry.provinces.length === regions.length
+                                  : !!entry?.selected
+                              }
+                              indeterminate={
+                                regions.length
+                                  ? Array.isArray(entry?.provinces) &&
+                                    entry.provinces.length > 0 &&
+                                    entry.provinces.length < regions.length
+                                  : false
+                              }
+                              onChange={(isChecked) => {
+                                if (isChecked) selectAllInCountry(groupKey, cc);
+                                else clearAllInCountry(groupKey, cc);
+                              }}
+                            />
+                            <Text as="span" variant="bodySm" fontWeight="semibold">
+                              Select all
+                            </Text>
+                          </InlineGrid>
+
+                          {/* Region rows */}
+                          {regions.length ? (
+                            regions
+                              .filter((r) => matchesSearch(r.name) || !searchQuery.trim())
+                              .map((r) => {
+                                const selectedSet = new Set(Array.isArray(entry?.provinces) ? entry.provinces : []);
+                                const isChecked = selectedSet.has(r.code);
+
+                                return (
+                                  <InlineGrid
+                                    key={`${groupKey}-${cc}-${r.code}`}
+                                    columns={["auto", "1fr"]}
+                                    gap="200"
+                                    alignItems="center"
+                                  >
+                                    <Checkbox
+                                      label=""
+                                      checked={isChecked}
+                                      onChange={(isNowChecked) => toggleRegion(groupKey, cc, r.code, isNowChecked)}
+                                    />
+                                    <Text as="span" variant="bodySm">
+                                      {r.name}
+                                    </Text>
+                                  </InlineGrid>
+                                );
+                              })
+                          ) : (
+                            // No provinces returned for this country; show a single “All of country” checkbox row
+                            <InlineGrid columns={["auto", "1fr"]} gap="200" alignItems="center">
+                              <Checkbox
+                                label=""
+                                checked={!!entry?.selected}
+                                onChange={(isNowChecked) => toggleRegion(groupKey, cc, "__ALL__", isNowChecked)}
+                              />
+                              <Text as="span" variant="bodySm">
+                                All of {countryName}
+                              </Text>
+                            </InlineGrid>
+                          )}
+                        </BlockStack>
+                      </Box>
+                    </Collapsible>
+                  </Box>
+                );
+              })}
+            </BlockStack>
+          </Box>
+        </Collapsible>
+      </Box>
+    );
+  };
 
   return (
     <Page title="Settings">
       <BlockStack gap="400">
         <Card>
           <BlockStack gap="300">
-            <InlineStack align="space-between">
+            <InlineStack align="space-between" blockAlign="center">
               <Text as="h2" variant="headingMd">
                 Zones Managed by this app
               </Text>
@@ -247,37 +920,24 @@ export default function SettingsIndex() {
             </InlineStack>
 
             <Text as="p" variant="bodyMd" tone="subdued">
-              Choose which Shopify shipping zones this app will manage. Zones not selected will fall back to Shopify/manual
-              rates (carrier service returns an empty list outside managed zones).
+              Select countries and regions this app should manage. Anything not selected will fall back to Shopify/manual rates.
             </Text>
 
             <Divider />
 
-            {draftManagedZoneIds.length === 0 ? (
-              <Box paddingBlockStart="200">
+            <BlockStack gap="250">
+              {renderSelectedGroupSummary("northAmerica", "North America", northAmericaCountryCodes)}
+              {renderSelectedGroupSummary("international", "International", internationalCountryCodes)}
+
+              {!Object.keys(draftConfig.groups.northAmerica.countries || {}).length &&
+              !Object.keys(draftConfig.groups.international.countries || {}).length ? (
                 <Text as="p" variant="bodyMd" tone="subdued">
                   No zones selected yet.
                 </Text>
-              </Box>
-            ) : (
-              <BlockStack gap="200">
-                {selectedZones.length ? (
-                  selectedZones.map((z) => (
-                    <InlineStack key={z.id} align="space-between">
-                      <Text as="span" variant="bodyMd">
-                        {z.name}
-                      </Text>
-                      <Badge tone="success">Managed</Badge>
-                    </InlineStack>
-                  ))
-                ) : (
-                  <Text as="p" variant="bodyMd" tone="subdued">
-                    Selected zone IDs are saved, but the zones snapshot doesn’t currently include matching zone objects.
-                    (This is expected until the zones snapshot normalization is finalized.)
-                  </Text>
-                )}
-              </BlockStack>
-            )}
+              ) : null}
+            </BlockStack>
+
+            {/* Bottom-left sync label */}
             <Box paddingBlockStart="300">
               <InlineStack align="space-between" blockAlign="center">
                 <InlineStack gap="100" blockAlign="center">
@@ -286,11 +946,7 @@ export default function SettingsIndex() {
                     {zonesLastUpdatedLabel}
                   </Text>
                 </InlineStack>
-
-                {/* Optional: show error state without adding any “refresh” action */}
-                {settings?.lastSyncError ? (
-                  <Badge tone="critical">Sync issue</Badge>
-                ) : null}
+                {settings?.lastSyncError ? <Badge tone="critical">Sync issue</Badge> : null}
               </InlineStack>
 
               {settings?.lastSyncError ? (
@@ -301,55 +957,32 @@ export default function SettingsIndex() {
                 </Box>
               ) : null}
             </Box>
+
+            {/* Optional: show markets warning if scope missing */}
+            {zonesSnapshot?._meta?.marketsError ? (
+              <Box paddingBlockStart="200">
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Markets filter unavailable (needs read_markets scope): {String(zonesSnapshot._meta.marketsError)}
+                </Text>
+              </Box>
+            ) : null}
           </BlockStack>
         </Card>
 
         <Card>
           <BlockStack gap="300">
-            <Text as="h2" variant="headingMd">
-              Shipping Services
-            </Text>
-
+            <Text as="h2" variant="headingMd">Shipping Services</Text>
             <Text as="p" variant="bodyMd" tone="subdued">
-              Phase 1 is read-only: we display the synced services snapshot structure here. Next we’ll add the Shopify-style
-              selection UI and persistence.
+              Next: service selection (after zone selection is finalized).
             </Text>
-
-            <Divider />
-
-            {services.length === 0 ? (
-              <Text as="p" variant="bodyMd" tone="subdued">
-                No services snapshot available yet.
-              </Text>
-            ) : (
-              <BlockStack gap="150">
-                {services.slice(0, 12).map((s) => (
-                  <InlineStack key={s.code} align="space-between">
-                    <Text as="span" variant="bodyMd">
-                      {s.name}
-                    </Text>
-                    <Badge>{s.code}</Badge>
-                  </InlineStack>
-                ))}
-                {services.length > 12 ? (
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    Showing first 12 services…
-                  </Text>
-                ) : null}
-              </BlockStack>
-            )}
           </BlockStack>
         </Card>
 
         {/* Bottom-right actions (locked UX) */}
         <Box paddingBlockStart="200">
           <InlineStack align="end" gap="200">
-            <Button onClick={onCancel} disabled={saving}>
-              Cancel
-            </Button>
-            <Button variant="primary" onClick={onSave} loading={saving}>
-              Save
-            </Button>
+            <Button onClick={onCancel} disabled={saving}>Cancel</Button>
+            <Button variant="primary" onClick={onSave} loading={saving}>Save</Button>
           </InlineStack>
         </Box>
       </BlockStack>
@@ -357,122 +990,37 @@ export default function SettingsIndex() {
       <Modal
         open={zoneModalOpen}
         onClose={() => setZoneModalOpen(false)}
-        title="Select Shipping Zones"
-        primaryAction={{
-          content: "Done",
-          onAction: () => setZoneModalOpen(false),
-        }}
+        title="Select shipping zones"
+        primaryAction={{ content: "Done", onAction: () => setZoneModalOpen(false) }}
         secondaryActions={[
           {
             content: "Cancel",
             onAction: () => {
-              // revert draft changes back to saved state
-              setDraftManagedZoneIds(managedZoneIds);
+              setDraftConfig(savedConfig);
               setZoneModalOpen(false);
             },
           },
         ]}
       >
         <Modal.Section>
-          {zones.length === 0 ? (
-            <BlockStack gap="200">
-              <Text as="p" variant="bodyMd">
-                No zones snapshot found.
-              </Text>
-              <Text as="p" variant="bodyMd" tone="subdued">
-                This page expects zones to be synced daily from Shopify into <Text as="span" variant="bodyMd">zonesSnapshotJson</Text>.
-              </Text>
-            </BlockStack>
-          ) : (
-            <ResourceList
-              resourceName={{ singular: "zone", plural: "zones" }}
-              items={zones}
-              renderItem={(zone) => {
-                const selected = draftManagedZoneIds.includes(zone.id);
-                return (
-                  <ResourceItem
-                    id={zone.id}
-                    accessibilityLabel={`Select ${zone.name}`}
-                    onClick={() => toggleZone(zone.id)}
-                  >
-                    <BlockStack gap="150">
-                      <InlineStack align="space-between" blockAlign="center">
-                        <Text as="span" variant="bodyMd">
-                          {zone.name}
-                        </Text>
-
-                        <ButtonGroup>
-                          <Button
-                            size="slim"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleZoneExpanded(zone.id);
-                            }}
-                          >
-                            {isZoneExpanded(zone.id) ? "Hide" : "View"}
-                          </Button>
-                          <Badge tone={selected ? "success" : undefined}>
-                            {selected ? "Selected" : "Not selected"}
-                          </Badge>
-                        </ButtonGroup>
-                      </InlineStack>
-
-                      <Collapsible open={isZoneExpanded(zone.id)}>
-                        {Array.isArray(zone.countries) && zone.countries.length ? (
-                          <Box paddingBlockStart="150">
-                            <BlockStack gap="100">
-                              {zone.countries.slice(0, 12).map((c, idx) => {
-                                const countryName = String(c?.name || c?.countryName || c?.code || `Country ${idx + 1}`);
-                                const provinces = Array.isArray(c?.provinces) ? c.provinces : (Array.isArray(c?.regions) ? c.regions : []);
-                                return (
-                                  <Box key={`${zone.id}-c-${idx}`}>
-                                    <InlineStack align="space-between">
-                                      <Text as="span" variant="bodySm">
-                                        {countryName}
-                                      </Text>
-                                      {provinces.length ? (
-                                        <Text as="span" variant="bodySm" tone="subdued">
-                                          {provinces.length} provinces
-                                        </Text>
-                                      ) : null}
-                                    </InlineStack>
-
-                                    {provinces.length ? (
-                                      <Box paddingBlockStart="100">
-                                        <Text as="p" variant="bodySm" tone="subdued">
-                                          {provinces
-                                            .slice(0, 20)
-                                            .map((p) => String(p?.name || p?.code || p))
-                                            .join(", ")}
-                                          {provinces.length > 20 ? "…" : ""}
-                                        </Text>
-                                      </Box>
-                                    ) : null}
-                                  </Box>
-                                );
-                              })}
-
-                              {zone.countries.length > 12 ? (
-                                <Text as="p" variant="bodySm" tone="subdued">
-                                  Showing first 12 countries…
-                                </Text>
-                              ) : null}
-                            </BlockStack>
-                          </Box>
-                        ) : (
-                          <Box paddingBlockStart="150">
-                            <Text as="p" variant="bodySm" tone="subdued">
-                              No country/province details available in the current zones snapshot.
-                            </Text>
-                          </Box>
-                        )}
-                      </Collapsible>
-                    </BlockStack>
-                  </ResourceItem>
-                );
-              }}
+          <BlockStack gap="300">
+            <TextField
+              labelHidden
+              label="Search countries and regions to ship to"
+              prefix={<Icon source={SearchIcon} />}
+              placeholder="Search countries and regions to ship to"
+              value={searchQuery}
+              onChange={setSearchQuery}
+              autoComplete="off"
             />
-          )}
+
+            <Scrollable style={{ maxHeight: 520 }}>
+              <BlockStack gap="200">
+                {renderGroupPicker("northAmerica", "North America", northAmericaCountryCodes)}
+                {renderGroupPicker("international", "International", internationalCountryCodes)}
+              </BlockStack>
+            </Scrollable>
+          </BlockStack>
         </Modal.Section>
       </Modal>
     </Page>

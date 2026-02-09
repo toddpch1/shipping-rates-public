@@ -1,57 +1,51 @@
-import { Outlet, useLoaderData, useLocation, useNavigate } from "react-router";
+// app/routes/app.jsx
+import { Outlet, useLoaderData, useLocation } from "react-router";
+import { redirect } from "react-router";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
-import {
-  Frame,
-  Navigation,
-  Text,
-  Box,
-} from "@shopify/polaris";
-import { HomeIcon, SettingsIcon } from "@shopify/polaris-icons";
+import { NavMenu } from "@shopify/app-bridge-react";
+import { Frame } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 
+function base64HostFromShop(shop) {
+  // Common workaround: host is base64 + URL encoded. Many apps use `${shop}/admin`.
+  // Shopify expects `host` to represent the admin host context. :contentReference[oaicite:2]{index=2}
+  const raw = `${shop}/admin`;
+  return encodeURIComponent(Buffer.from(raw, "utf8").toString("base64"));
+}
+
 export async function loader({ request }) {
-  await authenticate.admin(request);
-  const apiKey = process.env.SHOPIFY_API_KEY || "";
-  return { apiKey };
+  const { session } = await authenticate.admin(request);
+
+  const url = new URL(request.url);
+  const host = url.searchParams.get("host");
+
+  // If we hard-refresh inside admin, Shopify sometimes does not include `host`.
+  // Without it, App Bridge won’t initialize and NavMenu will render as plain links in the iframe.
+  if (!host) {
+    url.searchParams.set("host", base64HostFromShop(session.shop));
+    url.searchParams.set("embedded", "1");
+    return redirect(url.toString());
+  }
+
+  return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 }
 
 export default function App() {
   const { apiKey } = useLoaderData();
   const location = useLocation();
-  const navigate = useNavigate();
-
-  const isActive = (path) =>
-    location.pathname === path || location.pathname.startsWith(path + "/");
+  const search = location.search || "";
 
   return (
     <AppProvider apiKey={apiKey} embedded>
-      <Frame
-        navigation={
-          <Navigation location={location.pathname}>
-            <Navigation.Section
-              items={[
-                {
-                  label: "Shipping Charts",
-                  icon: HomeIcon,
-                  url: "/app/tiers",
-                  selected: isActive("/app/tiers"),
-                  onClick: () => navigate("/app/tiers"),
-                },
-                {
-                  label: "Settings",
-                  icon: SettingsIcon,
-                  url: "/app/settings",
-                  selected: isActive("/app/settings"),
-                  onClick: () => navigate("/app/settings"),
-                },
-              ]}
-            />
-          </Navigation>
-        }
-      >
-        <Box padding="400">
-          <Outlet />
-        </Box>
+      {/* Dealeasy-style submenu under the app name in Shopify Admin */}
+      <NavMenu>
+        <a href={`/app/tiers${search}`}>Shipping Charts</a>
+        <a href={`/app/settings${search}`}>Settings</a>
+      </NavMenu>
+
+      {/* Keep Frame for Polaris layout; NO in-app sidebar */}
+      <Frame>
+        <Outlet />
       </Frame>
     </AppProvider>
   );

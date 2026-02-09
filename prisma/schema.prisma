@@ -129,6 +129,9 @@ model ShopSettings {
   /// Shopify zone IDs this app manages (JSON array of GIDs)
   managedZoneIdsJson String @default("[]")
 
+  /// Granular selection per zone (JSON array). Supports zone/country/province selections.
+  managedZoneConfigJson String @default("[]")
+
   /// Snapshot of zone definitions pulled from Shopify
   zonesSnapshotJson String @default("{}")
 
