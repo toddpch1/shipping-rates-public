@@ -146,5 +146,7 @@ model ShopSettings {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+    managedServiceIdsJson String?
 }
 
