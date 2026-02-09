@@ -150,9 +150,13 @@ function extractCountriesFromDeliveryProfilesSnapshot(snapshot) {
 
       // Option B: Shopify query includes locationGroupZones.zone.countries[].provinces[] (official docs example)
       const lgzEdges = plg?.locationGroupZones?.edges || [];
-      for (const lgzEdge of lgzEdges) {
-        const zone = lgzEdge?.node?.zone;
-        const countries = zone?.countries || [];
+      const lgzNodes = plg?.locationGroupZones?.nodes || [];
+      const lgzs = lgzEdges.length ? lgzEdges.map((e) => e?.node) : lgzNodes;
+
+      for (const lgz of lgzs) {
+        const zone = lgz?.zone;
+        const countries = Array.isArray(zone?.countries) ? zone.countries : [];
+
         for (const c of countries) {
           const countryCode = c?.code?.countryCode;
           if (!countryCode) continue;
@@ -224,7 +228,6 @@ async function fetchMarketsDigestAndCountryCodes(admin) {
     const regions = m?.regions?.nodes || [];
     for (const r of regions) {
       if (r?.__typename === "MarketRegionCountry" && r?.code) countryCodes.add(r.code);
-      if (r?.__typename === "MarketRegionProvince" && r?.country?.code) countryCodes.add(r.country.code);
     }
   }
 
@@ -239,7 +242,7 @@ async function fetchMarketsDigestAndCountryCodes(admin) {
             t: r.__typename,
             name: r.name,
             code: r.code || null,
-            country: r?.country?.code || null,
+            // country removed (we only support MarketRegionCountry regions)
           }))
           .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
       }))
@@ -385,8 +388,7 @@ export async function loader({ request }) {
   // 2) If markets changed, force a sync (zones/services) immediately (throttled)
   const shouldForceSync =
     marketsDigest &&
-    existingMarketsDigest &&
-    marketsDigest !== existingMarketsDigest &&
+    (existingMarketsDigest == null || marketsDigest !== existingMarketsDigest) &&
     now - lastSyncedAt > THROTTLE_MS;
 
   if (shouldForceSync || (!settings?.zonesSnapshotJson && now - lastSyncedAt > 5000)) {
@@ -521,6 +523,7 @@ export default function SettingsIndex() {
   const zonesCountriesByCode = useMemo(() => {
     return extractCountriesFromDeliveryProfilesSnapshot(zonesSnapshot || {});
   }, [zonesSnapshot]);
+  const debugZonesCount = Object.keys(zonesCountriesByCode || {}).length;
 
   // Markets filter (truth = Markets). If markets scope isn’t available yet, this may be null.
   const marketCountryCodes = useMemo(() => {
@@ -948,6 +951,10 @@ export default function SettingsIndex() {
                 </InlineStack>
                 {settings?.lastSyncError ? <Badge tone="critical">Sync issue</Badge> : null}
               </InlineStack>
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Debug: zonesCountriesByCode = {debugZonesCount}
+                </Text>
+
 
               {settings?.lastSyncError ? (
                 <Box paddingBlockStart="150">
