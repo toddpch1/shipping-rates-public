@@ -192,6 +192,15 @@ export async function action({ request }) {
 
     try {
       const session = await sessionStorage.loadSession(row.id);
+      console.log("[internal sync] loaded session", {
+        id: row.id,
+        shopFromRow: shop,
+        shopFromSession: session?.shop,
+        tokenLen: session?.accessToken?.length ?? 0,
+        tokenPrefix: session?.accessToken ? session.accessToken.slice(0, 6) : null,
+        tokenSuffix: session?.accessToken ? session.accessToken.slice(-4) : null,
+      });
+
       if (!session) throw new Error(`Offline session missing for ${shop}`);
 
       const zonesSnapshot = await fetchZonesSnapshot(session);

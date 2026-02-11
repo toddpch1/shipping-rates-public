@@ -431,6 +431,45 @@ export async function loader({ request }) {
     update: {},
     create: { shop },
   });
+  // Auto-first-sync: if this shop has never synced, do it immediately on first Settings load.
+if (!settings?.lastSyncedAt) {
+  try {
+    const zonesSnapshot = await fetchZonesSnapshot(session);
+    const servicesSnapshot = await fetchServicesSnapshot(session);
+
+    settings = await prisma.shopSettings.upsert({
+      where: { shop: session.shop },
+      create: {
+        shop: session.shop,
+        zonesSnapshotJson: JSON.stringify(zonesSnapshot),
+        servicesSnapshotJson: JSON.stringify(servicesSnapshot),
+        managedZoneIdsJson: "[]",
+        lastSyncedAt: new Date(),
+        lastSyncError: null,
+      },
+      update: {
+        zonesSnapshotJson: JSON.stringify(zonesSnapshot),
+        servicesSnapshotJson: JSON.stringify(servicesSnapshot),
+        lastSyncedAt: new Date(),
+        lastSyncError: null,
+      },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await prisma.shopSettings.upsert({
+      where: { shop: session.shop },
+      create: {
+        shop: session.shop,
+        managedZoneIdsJson: "[]",
+        zonesSnapshotJson: "{}",
+        servicesSnapshotJson: "{}",
+        lastSyncedAt: null,
+        lastSyncError: msg,
+      },
+      update: { lastSyncError: msg },
+    });
+  }
+}
 
   const existingZonesSnapshot = safeJsonParse(settings?.zonesSnapshotJson, null);
   const existingMeta = existingZonesSnapshot?._meta || {};
