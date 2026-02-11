@@ -34,6 +34,9 @@ import {
 } from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+// TEMP: pause Shipping Services UI + sync.
+// We’ll re-enable later once service labels are sourced correctly.
+const ENABLE_SHIPPING_SERVICES = false;
 
 /* ---------------- helpers ---------------- */
 
@@ -322,23 +325,27 @@ async function syncShippingConfig(admin) {
     return true;
   });
 
-  // B) Services query (methodDefinitions only) — keep this focused
-  const servicesQuery = `#graphql
-    query DeliveryServicesOnly {
-      deliveryProfiles(first: 25) {
-        edges {
-          node {
-            profileLocationGroups {
-              locationGroupZones(first: 150) {
-                edges {
-                  node {
-                    methodDefinitions(first: 250) {
-                      edges {
-                        node {
-                          id
-                          active
-                          name
-                          description
+      // B) Services query — capped to stay under cost limit
+const servicesQuery = `#graphql
+  query DeliveryServicesOnly {
+    deliveryProfiles(first: 10) {
+      edges {
+        node {
+          profileLocationGroups {
+            locationGroupZones(first: 25) {
+              edges {
+                node {
+                  methodDefinitions(first: 50) {
+                    edges {
+                      node {
+                        id
+                        active
+                        name
+                        rateProvider {
+                          __typename
+                          ... on DeliveryParticipant {
+                            id
+                          }
                         }
                       }
                     }
@@ -350,55 +357,68 @@ async function syncShippingConfig(admin) {
         }
       }
     }
-  `;
-
-  const servicesRes = await admin.graphql(servicesQuery);
-  const servicesJson = await servicesRes.json();
-  if (servicesJson?.errors?.length) {
-    throw new Error(servicesJson.errors.map((e) => e.message).join("; "));
   }
+`;
 
-  const services = [];
-  const dpEdges2 = servicesJson?.data?.deliveryProfiles?.edges || [];
-  for (const dpEdge of dpEdges2) {
-    const plgs = dpEdge?.node?.profileLocationGroups || [];
-    for (const plg of plgs) {
-      const lgzEdges = plg?.locationGroupZones?.edges || [];
-      for (const lgzEdge of lgzEdges) {
-        const mdEdges = lgzEdge?.node?.methodDefinitions?.edges || [];
-        for (const mdEdge of mdEdges) {
-          const md = mdEdge?.node;
-          if (!md?.id) continue;
-          // IMPORTANT: list what is actually available — active only by default
-          if (!md.active) continue;
+const servicesRes = await admin.graphql(servicesQuery);
+const servicesJson = await servicesRes.json();
+if (servicesJson?.errors?.length) {
+  throw new Error(servicesJson.errors.map((e) => e.message).join("; "));
+}
 
-          services.push({
-            id: md.id,
-            name: md.name || md.description || "Shipping service",
-            active: !!md.active,
-            description: md.description || null,
-          });
-        }
+// Build service list from methodDefinitions (human-facing labels)
+const services = [];
+const dpEdges2 = servicesJson?.data?.deliveryProfiles?.edges || [];
+
+for (const dpEdge of dpEdges2) {
+  const plgs = dpEdge?.node?.profileLocationGroups || [];
+  for (const plg of plgs) {
+    const lgzEdges = plg?.locationGroupZones?.edges || [];
+    for (const lgzEdge of lgzEdges) {
+      const mdEdges = lgzEdge?.node?.methodDefinitions?.edges || [];
+      for (const mdEdge of mdEdges) {
+        const md = mdEdge?.node;
+        if (!md?.id) continue;
+
+        const rp = md?.rateProvider;
+        const participantName =
+          rp?.__typename === "DeliveryParticipant" ? (rp?.name || null) : null;
+
+        services.push({
+          id: String(md.id),
+          name: String(md.name || "Shipping service"), // <-- THIS is the label you want
+          active: !!md.active,
+          participantName,
+          description: participantName || null, // carrier label for grouping
+        });
       }
     }
   }
+}
 
-  const seen = new Set();
-  const servicesDeduped = services.filter((s) => {
+// Dedup by id + stable sort by label
+const seen = new Set();
+const servicesDeduped = services
+  .filter((s) => {
     if (seen.has(s.id)) return false;
     seen.add(s.id);
     return true;
-  }).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  })
+  .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 
-  return {
-    zonesSnapshot: {
-      version: 1,
-      pulledAt: new Date().toISOString(),
-      zones: zonesDeduped,
-    },
-    servicesSnapshot: { services: servicesDeduped },
-  };
-}
+return {
+  zonesSnapshot: {
+    version: 1,
+    pulledAt: new Date().toISOString(),
+    zones: zonesDeduped,
+  },
+  servicesSnapshot: {
+    version: 2,
+    services: servicesDeduped,
+  },
+};
+
+  }
 
 /* ---------------- loader ---------------- */
 
@@ -437,8 +457,23 @@ export async function loader({ request }) {
     (existingMarketsDigest == null || marketsDigest !== existingMarketsDigest) &&
     now - lastSyncedAt > THROTTLE_MS;
 
-  if (shouldForceSync || (!settings?.zonesSnapshotJson && now - lastSyncedAt > 5000)) {
-    try {
+  const existingServicesSnapshot = safeJsonParse(settings?.servicesSnapshotJson, null);
+  const hasServicesSnapshot =
+    Array.isArray(existingServicesSnapshot?.services) && existingServicesSnapshot.services.length > 0;
+
+  // Force re-sync if snapshot missing OR from older format/version
+  const servicesSnapshotVersion = Number(existingServicesSnapshot?.version || 0);
+  const shouldSyncServices = ENABLE_SHIPPING_SERVICES
+  ? (!hasServicesSnapshot || servicesSnapshotVersion < 2)
+  : false;
+
+
+  if (
+    shouldForceSync ||
+    shouldSyncServices ||
+    (!settings?.zonesSnapshotJson && now - lastSyncedAt > 5000)
+  ) {
+      try {
       const { zonesSnapshot, servicesSnapshot } = await syncShippingConfig(admin);
 
       const withMeta = {
@@ -455,7 +490,9 @@ export async function loader({ request }) {
         where: { shop },
         data: {
           zonesSnapshotJson: JSON.stringify(withMeta),
-          servicesSnapshotJson: JSON.stringify(servicesSnapshot),
+          ...(ENABLE_SHIPPING_SERVICES
+            ? { servicesSnapshotJson: JSON.stringify(servicesSnapshot) }
+            : {}),
           lastSyncedAt: new Date(),
           lastSyncError: null,
         },
@@ -471,7 +508,6 @@ export async function loader({ request }) {
       return { settings: updated };
     }
   }
-
   // Persist markets meta even if we didn’t sync (so picker can filter)
   if (settings?.zonesSnapshotJson && (marketsDigest || marketsError)) {
     const nextSnapshot = existingZonesSnapshot || {};
@@ -506,7 +542,9 @@ export async function action({ request }) {
   if (intent !== "save") return { ok: false, error: "Unknown intent" };
 
   const managedZoneConfigJson = String(formData.get("managedZoneConfigJson") || "{}");
-  const managedServiceIdsJson = String(formData.get("managedServiceIdsJson") || "[]");
+  const managedServiceIdsJson = ENABLE_SHIPPING_SERVICES
+    ? String(formData.get("managedServiceIdsJson") || "[]")
+    : "[]";
 
   let zonesParsed = getDefaultConfig();
   try {
@@ -527,7 +565,7 @@ export async function action({ request }) {
     where: { shop },
     data: {
       managedZoneConfigJson: JSON.stringify(zonesParsed),
-      managedServiceIdsJson: JSON.stringify(serviceIds),
+      ...(ENABLE_SHIPPING_SERVICES ? { managedServiceIdsJson: JSON.stringify(serviceIds) } : {}),
     },
   });
 
@@ -564,11 +602,30 @@ export default function SettingsIndex() {
   const [expandedGroups, setExpandedGroups] = useState(() => new Set());
   const [expandedCountries, setExpandedCountries] = useState(() => new Set());
   const [searchQuery, setSearchQuery] = useState("");
+  const [servicesSearchQuery, setServicesSearchQuery] = useState("");
+  const resetZonesModalUi = useCallback(() => {
+    setSearchQuery("");
+    setExpandedGroups(new Set());
+    setExpandedCountries(new Set());
+  }, []);
+  const resetServicesModalUi = useCallback(() => {
+    setServicesSearchQuery("");
+  }, []);
 
   useEffect(() => setDraftConfig(savedConfig), [JSON.stringify(savedConfig)]);
   useEffect(() => {
-    if (actionData?.ok !== undefined) setSaving(false);
-  }, [actionData?.ok]);
+    // Locked UX: Save redirects to /app/tiers; Cancel already does this.
+    if (actionData?.ok === true) {
+      setSaving(false);
+      navigate(`/app/tiers${search}`);
+      return;
+    }
+
+    // If we got a non-success response, still stop the spinner
+    if (actionData?.ok !== undefined) {
+      setSaving(false);
+    }
+  }, [actionData?.ok, navigate, search]);
 
   const zonesSnapshot = useMemo(
     () => safeJsonParse(settings?.zonesSnapshotJson, null),
@@ -606,6 +663,22 @@ export default function SettingsIndex() {
   }, [availableCountryCodes]);
 
   // Services snapshot + selection
+  // --- Services UI helpers (must be above first use) ---
+function normalizeServiceNameKey(service) {
+  // Key = exact Shopify label (trim only).
+  // Lowercasing is fine for dup detection, but do NOT rewrite underscores/spaces.
+  return String(service?.name || "").trim().toLowerCase();
+}
+function prettifyServiceName(service) {
+  // Shopify already provides the correct human-facing label.
+  // Keep it verbatim so it matches invoices and Admin UI.
+  return String(service?.name || "Service").trim();
+}
+function shortServiceId(id) {
+  const s = String(id || "");
+  if (!s) return "";
+  return s.length > 6 ? `…${s.slice(-6)}` : s;
+}
   const servicesSnapshot = useMemo(
     () => safeJsonParse(settings?.servicesSnapshotJson, { services: [] }),
     [settings?.servicesSnapshotJson],
@@ -614,13 +687,55 @@ export default function SettingsIndex() {
     ? servicesSnapshot.services
     : [];
 
+  const inferCarrier = (service) => {
+    // Prefer participantName when present (best grouping signal)
+    const pn = String(service?.participantName || "").trim();
+    if (pn) return pn;
+
+    const hay = `${service?.name || ""} ${service?.description || ""}`.toLowerCase();
+    if (hay.includes("usps")) return "USPS";
+    if (hay.includes("ups")) return "UPS";
+    if (hay.includes("dhl")) return "DHL";
+    return "Other";
+  };
+
+  const serviceNameCounts = useMemo(() => {
+    const m = new Map();
+    for (const s of availableServices) {
+      const k = normalizeServiceNameKey(s);
+      if (!k) continue;
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return m;
+  }, [availableServices]);
+
   const savedServiceIds = useMemo(() => {
     const arr = safeJsonParse(settings?.managedServiceIdsJson, []);
     return Array.isArray(arr) ? arr.map(String) : [];
   }, [settings?.managedServiceIdsJson]);
 
   const [draftServiceIds, setDraftServiceIds] = useState(savedServiceIds);
-  useEffect(() => setDraftServiceIds(savedServiceIds), [savedServiceIds.join("|")]);
+  useEffect(() => {
+    // Deterministic:
+    // - If saved selection exists, use it.
+    // - Otherwise, if services exist, default to all selected.
+    // - Otherwise, empty.
+    if (savedServiceIds.length > 0) {
+      setDraftServiceIds(savedServiceIds);
+      resetServicesModalUi();
+      return;
+    }
+
+    if (availableServices.length > 0) {
+      setDraftServiceIds(availableServices.map((s) => String(s.id)));
+      return;
+    }
+
+    setDraftServiceIds([]);
+  }, [
+    savedServiceIds.join("|"),
+    availableServices.map((s) => String(s.id)).join("|"),
+  ]);
 
   const toggleGroup = useCallback((groupKey) => {
     setExpandedGroups((prev) => {
@@ -897,6 +1012,7 @@ export default function SettingsIndex() {
                           {/* Select all row */}
                           <Checkbox
                             label="Select all"
+                            disabled={saving}
                             checked={
                               regions.length
                                 ? Array.isArray(entry?.provinces) && entry.provinces.length === regions.length
@@ -928,6 +1044,7 @@ export default function SettingsIndex() {
                                     key={`${groupKey}-${cc}-${r.code}`}
                                     label={r.name}
                                     checked={isChecked}
+                                    disabled={saving}
                                     onChange={(isNowChecked) => toggleRegion(groupKey, cc, r.code, isNowChecked)}
                                   />
                                 );
@@ -936,6 +1053,7 @@ export default function SettingsIndex() {
                             <Checkbox
                               label={`All of ${countryName}`}
                               checked={!!entry?.selected}
+                              disabled={saving}
                               onChange={(isNowChecked) => toggleRegion(groupKey, cc, "__ALL__", isNowChecked)}
                             />
                           )}
@@ -952,8 +1070,47 @@ export default function SettingsIndex() {
     );
   };
 
-  // Services UI
+    const groupedServices = useMemo(() => {
+      const groups = new Map(); // carrier -> services[]
+      for (const s of availableServices) {
+        const carrier = inferCarrier(s);
+        if (!groups.has(carrier)) groups.set(carrier, []);
+        groups.get(carrier).push(s);
+      }
+
+      // stable sort inside groups
+      for (const [k, arr] of groups.entries()) {
+        arr.sort((a, b) => String(a?.name || "").localeCompare(String(b?.name || "")));
+        groups.set(k, arr);
+      }
+
+      // stable carrier order
+      const order = ["USPS", "UPS", "DHL", "Other"];
+      const out = [];
+      for (const k of order) {
+        if (groups.has(k)) out.push([k, groups.get(k)]);
+      }
+      // any unexpected carrier keys
+      for (const [k, arr] of groups.entries()) {
+        if (!order.includes(k)) out.push([k, arr]);
+      }
+
+      return out; // [ [carrier, services[]], ... ]
+    }, [availableServices]);
+
   const servicesButtonLabel = draftServiceIds.length ? "Edit Services" : "Select Shipping Services";
+  const selectedServicesLabel = useMemo(() => {
+    const idToName = new Map(availableServices.map((s) => [String(s.id), String(s.name || "Service")]));
+    const names = draftServiceIds
+      .map((id) => idToName.get(String(id)))
+      .filter(Boolean);
+
+    if (names.length === 0) return "";
+    const first = names.slice(0, 4);
+    const more = names.length - first.length;
+    return more > 0 ? `${first.join(", ")} + ${more} more` : first.join(", ");
+  }, [availableServices, draftServiceIds]);
+
 
   return (
     <Page title="Settings">
@@ -1016,25 +1173,53 @@ export default function SettingsIndex() {
           </BlockStack>
         </Card>
 
-        {/* Shipping Services */}
-        <Card>
+        {/* Shipping Services (paused) */}
+        {ENABLE_SHIPPING_SERVICES ? (
+          <Card>
           <BlockStack gap="300">
             <InlineStack align="space-between" blockAlign="center">
               <Text as="h2" variant="headingMd">Shipping Services</Text>
-              <Button onClick={() => setServicesModalOpen(true)}>{servicesButtonLabel}</Button>
+              <Button
+                onClick={() => { setServicesSearchQuery(""); setServicesModalOpen(true); }}
+                disabled={availableServices.length === 0}
+              >
+                {servicesButtonLabel}
+              </Button>
             </InlineStack>
 
             <Text as="p" variant="bodyMd" tone="subdued">
-              Select which Shopify shipping services this app should manage. Unselected services fall back to Shopify/manual rates.
+              Select which Shopify shipping services to use as your defaults.
             </Text>
 
             <Divider />
 
-            <Text as="p" variant="bodySm" tone="subdued">
-              {draftServiceIds.length} selected of {availableServices.length} available
-            </Text>
+            <InlineStack align="space-between" blockAlign="center">
+                <Text as="p" variant="bodySm" tone="subdued">
+                  {draftServiceIds.length === availableServices.length && availableServices.length > 0
+                    ? "All services managed"
+                    : `${draftServiceIds.length} selected of ${availableServices.length} available`}
+                </Text>
+
+                {selectedServicesLabel ? (
+                  <Text as="p" variant="bodySm" tone="subdued">
+                    Selected: {selectedServicesLabel}
+                  </Text>
+                ) : null}
+              {settings?.lastSyncError ? <Badge tone="critical">Sync issue</Badge> : null}
+            </InlineStack>
+
+            {settings?.lastSyncError ? (
+              <Box paddingBlockStart="150">
+                <Text as="p" variant="bodySm" tone="critical">
+                  {settings.lastSyncError}
+                </Text>
+              </Box>
+            ) : null}
+
           </BlockStack>
-        </Card>
+                </Card>
+          ) : null}
+
 
         {/* Bottom-right actions (locked UX) */}
         <Box paddingBlockStart="200">
@@ -1050,12 +1235,16 @@ export default function SettingsIndex() {
         open={zoneModalOpen}
         onClose={() => setZoneModalOpen(false)}
         title="Select shipping zones"
-        primaryAction={{ content: "Done", onAction: () => setZoneModalOpen(false) }}
+        primaryAction={{
+          content: "Done",
+          onAction: () => { resetZonesModalUi(); setZoneModalOpen(false); },
+        }}
         secondaryActions={[
           {
             content: "Cancel",
             onAction: () => {
               setDraftConfig(savedConfig);
+              resetZonesModalUi();
               setZoneModalOpen(false);
             },
           },
@@ -1083,53 +1272,149 @@ export default function SettingsIndex() {
         </Modal.Section>
       </Modal>
 
-      {/* Services modal */}
+      {/* Services modal (paused) */}
+      {ENABLE_SHIPPING_SERVICES ? (
       <Modal
         open={servicesModalOpen}
         onClose={() => setServicesModalOpen(false)}
         title="Select shipping services"
-        primaryAction={{ content: "Done", onAction: () => setServicesModalOpen(false) }}
+        primaryAction={{
+          content: "Done",
+          onAction: () => { resetServicesModalUi(); setServicesModalOpen(false); },
+          disabled: saving,
+        }}
         secondaryActions={[
           {
             content: "Cancel",
             onAction: () => {
               setDraftServiceIds(savedServiceIds);
+              resetServicesModalUi();
               setServicesModalOpen(false);
             },
           },
         ]}
       >
         <Modal.Section>
-          <BlockStack gap="200">
+          <TextField
+            labelHidden
+            label="Search services"
+            prefix={<Icon source={SearchIcon} />}
+            placeholder="Search services"
+            value={servicesSearchQuery}
+            onChange={setServicesSearchQuery}
+            autoComplete="off"
+          />
+          <InlineStack gap="200">
+            <Button
+              variant="tertiary"
+              onClick={() => setDraftServiceIds(availableServices.map((s) => String(s.id)))}
+              disabled={availableServices.length === 0}
+            >
+              Select all
+            </Button>
+
+            <Button
+              variant="tertiary"
+              onClick={() => setDraftServiceIds([])}
+              disabled={draftServiceIds.length === 0}
+            >
+              Clear all
+            </Button>
+          </InlineStack>
+          <Scrollable style={{ maxHeight: 520 }}>
+            <BlockStack gap="200">
             {availableServices.length === 0 ? (
               <Text as="p" variant="bodyMd" tone="subdued">
-                No services found yet. Refresh Settings to re-sync.
+                No services found yet. Services are synced automatically in the Settings loader.
               </Text>
             ) : (
-              availableServices.map((s) => {
-                const id = String(s.id);
-                const checked = draftServiceIds.includes(id);
+              groupedServices
+                .map(([carrier, services]) => {
+                  const q = servicesSearchQuery.trim().toLowerCase();
 
-                return (
-                  <Checkbox
-                    key={id}
-                    label={s.name}
-                    checked={checked}
-                    onChange={(isNowChecked) => {
-                      setDraftServiceIds((prev) => {
-                        const next = new Set(prev.map(String));
-                        if (isNowChecked) next.add(id);
-                        else next.delete(id);
-                        return Array.from(next);
-                      });
-                    }}
-                  />
-                );
-              })
+                  const carrierMatches = q ? String(carrier).toLowerCase().includes(q) : false;
+                  const visibleServices = !q
+                    ? services
+                    : carrierMatches
+                      ? services
+                      : services.filter((s) => {
+                          const name = String(s?.name || "").toLowerCase();
+                          const desc = String(s?.description || "").toLowerCase();
+                          return name.includes(q) || desc.includes(q);
+                        });
+
+                  if (visibleServices.length === 0) return null;
+
+                  const carrierIds = services.map((s) => String(s.id));
+                  const allSelected = carrierIds.every((id) => draftServiceIds.includes(id));
+                  const someSelected = carrierIds.some((id) => draftServiceIds.includes(id));
+
+                  return (
+                    <BlockStack key={carrier} gap="100">
+                      <Checkbox
+                        label={carrier}
+                        checked={allSelected}
+                        indeterminate={!allSelected && someSelected}
+                        disabled={saving}
+                        onChange={(checked) => {
+                          setDraftServiceIds((prev) => {
+                            const set = new Set(prev.map(String));
+                            if (checked) carrierIds.forEach((id) => set.add(id));
+                            else carrierIds.forEach((id) => set.delete(id));
+                            return Array.from(set);
+                          });
+                        }}
+                      />
+
+                      <Box paddingInlineStart="400">
+                        <BlockStack gap="100">
+                          {visibleServices.map((s) => {
+                            const id = String(s.id);
+                            const checked = draftServiceIds.includes(id);
+
+                            const pretty = prettifyServiceName(s);
+                            const key = normalizeServiceNameKey(s);
+                            const isDup = key && (serviceNameCounts.get(key) || 0) > 1;
+
+                            const labelText = isDup ? `${pretty} (${shortServiceId(s.id)})` : pretty;
+
+                            const rawDesc = s?.description ? String(s.description).trim() : "";
+                            const looksMachine = /^[a-z0-9]+(?:[_-][a-z0-9]+)+$/i.test(rawDesc);
+                            const helpTextText =
+                              rawDesc && rawDesc !== labelText && !looksMachine ? rawDesc : undefined;
+                            return (
+                              <Checkbox
+                                key={id}
+                                label={labelText}
+                                helpText={helpTextText}
+
+
+                                checked={checked}
+                                disabled={saving}
+                                onChange={(isNowChecked) => {
+                                  setDraftServiceIds((prev) => {
+                                    const set = new Set(prev.map(String));
+                                    if (isNowChecked) set.add(id);
+                                    else set.delete(id);
+                                    return Array.from(set);
+                                  });
+                                }}
+                              />
+                            );
+                          })}
+                        </BlockStack>
+                      </Box>
+                    </BlockStack>
+                  );
+                })
+                .filter(Boolean)
+
             )}
           </BlockStack>
+          </Scrollable>
         </Modal.Section>
-      </Modal>
+            </Modal>
+      ) : null}
     </Page>
   );
 }
