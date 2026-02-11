@@ -8,6 +8,7 @@ import {
   Button,
   ButtonGroup,
   InlineStack,
+  BlockStack,
   Box,
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
@@ -25,7 +26,8 @@ export async function loader({ request }) {
     orderBy: [{ priority: "asc" }, { createdAt: "desc" }],
   });
 
-  return { charts };
+  // ✅ include shop so we can build an admin/settings link
+  return { charts, shop };
 }
 
 /**
@@ -38,14 +40,12 @@ export async function action({ request }) {
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const id = String(formData.get("id") || "");
-
   if (!id) return { ok: false, error: "Missing id" };
 
   const chart = await prisma.shippingChart.findFirst({
     where: { id, shop },
     select: { id: true, isActive: true, name: true },
   });
-
   if (!chart) return { ok: false, error: "Chart not found" };
 
   if (intent === "toggle-active") {
@@ -74,7 +74,7 @@ export async function action({ request }) {
 }
 
 export default function ShippingChartsIndex() {
-  const { charts } = useLoaderData();
+  const { charts, shop } = useLoaderData();
   const submit = useSubmit();
   const navigate = useNavigate();
   const location = useLocation();
@@ -89,15 +89,15 @@ export default function ShippingChartsIndex() {
 
   const emptyStateMarkup = (
     <Box padding="400">
-      <Text as="h2" variant="headingMd">
-        No shipping charts yet
-      </Text>
-      <Box paddingBlockStart="200">
-        <Text as="p" tone="subdued">
+      <BlockStack gap="200">
+        <Text as="h3" variant="headingMd">
+          No shipping charts yet
+        </Text>
+        <Text as="p" variant="bodyMd" tone="subdued">
           Create your first chart to start configuring tiered shipping rates.
         </Text>
-      </Box>
-      {/* Intentionally no Create button here (Page primaryAction is the single Create entry point) */}
+        {/* Intentionally no Create button here (Page primaryAction is the single Create entry point) */}
+      </BlockStack>
     </Box>
   );
 
@@ -111,7 +111,7 @@ export default function ShippingChartsIndex() {
     return (
       <IndexTable.Row id={chart.id} key={chart.id} position={index}>
         <IndexTable.Cell>
-          <Text variant="bodyMd" fontWeight="semibold" as="span">
+          <Text as="span" variant="bodyMd" fontWeight="semibold">
             {chart.name}
           </Text>
         </IndexTable.Cell>
@@ -135,10 +135,7 @@ export default function ShippingChartsIndex() {
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-                  submit(
-                    { intent: "toggle-active", id: chart.id },
-                    { method: "post" }
-                  );
+                  submit({ intent: "toggle-active", id: chart.id }, { method: "post" });
                 }}
               >
                 {chart.isActive ? "Disable" : "Enable"}
@@ -149,12 +146,10 @@ export default function ShippingChartsIndex() {
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
-
                   const ok = window.confirm(
-                    `Delete "${chart.name}"?\n\nThis will permanently delete:\n• the chart\n• all tiers\n• all selectors\n\nThis cannot be undone.`
+                    `Delete "${chart.name}"?\n\nThis will permanently delete:\n• the chart\n• all tiers\n• all selectors\n\nThis cannot be undone.`,
                   );
                   if (!ok) return;
-
                   submit({ intent: "delete-chart", id: chart.id }, { method: "post" });
                 }}
               >
@@ -169,20 +164,54 @@ export default function ShippingChartsIndex() {
 
   return (
     <Page
-      title="Shipping charts"
-      primaryAction={{ content: "Create shipping chart", onAction: goCreate }}
+      title="Shipping Charts"
+      primaryAction={{ content: "Create chart", onAction: goCreate }}
     >
-      <Card padding="0">
-        <IndexTable
-          resourceName={resourceName}
-          itemCount={charts.length}
-          headings={[{ title: "Chart" }, { title: "Status" }, { title: "Actions" }]}
-          selectable={false}
-          emptyState={emptyStateMarkup}
-        >
-          {rowMarkup}
-        </IndexTable>
-      </Card>
+      <BlockStack gap="400">
+        <Card>
+          {charts.length === 0 ? (
+            emptyStateMarkup
+          ) : (
+            <IndexTable
+              resourceName={resourceName}
+              itemCount={charts.length}
+              selectable={false}
+              headings={[
+                { title: "Chart" },
+                { title: "Status" },
+                { title: "Actions" },
+              ]}
+            >
+              {rowMarkup}
+            </IndexTable>
+          )}
+        </Card>
+
+        {/* ✅ Warning card (requested) */}
+        <Card>
+          <BlockStack gap="200">
+            <Text as="h3" variant="headingSm">
+              Important: Verify Shipping Zone Assignment
+            </Text>
+
+            <Text as="p" variant="bodyMd" tone="subdued">
+              Shopify may automatically enable this app’s calculated rates in existing shipping
+              zones. Review Shopify Shipping and delivery profiles to ensure each chart is only
+              enabled in the zones you intend.
+            </Text>
+
+            <Text as="p" variant="bodySm">
+              <a
+                href={`https://${shop}/admin/settings/shipping`}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                Open Shopify Shipping and delivery settings →
+              </a>
+            </Text>
+          </BlockStack>
+        </Card>
+      </BlockStack>
     </Page>
   );
 }
