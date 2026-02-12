@@ -102,12 +102,32 @@ export async function action({ request }) {
   let payload;
   try {
     payload = JSON.parse(rawBody);
+    console.log("[/api/rates] keys", Object.keys(payload || {}));
+    console.log("[/api/rates] rate keys", Object.keys(payload?.rate || {}));
+    console.log("[/api/rates] first item sample", JSON.stringify(payload?.rate?.items?.[0] ?? null, null, 2));
+    console.log("[/api/rates] discounts sample", JSON.stringify(payload?.rate?.discounts ?? payload?.rate?.applied_discounts ?? null, null, 2));
+    console.log("[/api/rates] order_totals", JSON.stringify(payload?.rate?.order_totals ?? null, null, 2));
   } catch {
     // Fail closed: no rates
     return json({ rates: [] });
   }
 
   const items = (payload?.rate?.items ?? []).filter((i) => i.requires_shipping);
+  // DEBUG: inspect carrier payload item fields (remove once confirmed)
+const first = payload?.rate?.items?.[0] ?? null;
+if (first) {
+  console.log("[/api/rates] first item keys", Object.keys(first));
+  console.log("[/api/rates] first item price fields", {
+    price: first.price,
+    discounted_price: first.discounted_price,
+    line_price: first.line_price,
+    total_price: first.total_price,
+    original_line_price: first.original_line_price,
+    original_price: first.original_price,
+  });
+}
+console.log("[/api/rates] order_totals", payload?.rate?.order_totals);
+
   if (items.length === 0) return json({ rates: [] });
 
   // Shipping basis (locked):
@@ -127,7 +147,10 @@ export async function action({ request }) {
     merchCents += unitCents * qty;
   }
 
-  // --- Managed zones gate (locked behavior) ---
+  // --- Managed zones gate ---
+  // TEMP: disable gate while Settings are paused so we can validate tier math + Shopify shipping discounts.
+  // When you re-enable managed zones later, flip this to true.
+  const ENABLE_MANAGED_ZONE_GATE = false;
   const shopSettings = await prisma.shopSettings.findUnique({ where: { shop } });
 
   let managedZoneConfig = null;
@@ -144,7 +167,7 @@ export async function action({ request }) {
   const destProvince = dest.province_code || dest.province || "";
 
   // Outside managed zones => [] so Shopify/manual rates apply (locked)
-  if (!isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
+  if (ENABLE_MANAGED_ZONE_GATE && !isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
     return json({ rates: [] });
   }
 
@@ -159,9 +182,12 @@ export async function action({ request }) {
     orderBy: { priority: "desc" },
   });
 
-  const basisCents = merchCents;
+  const basisCentsRaw = payload?.rate?.order_totals?.total_price;
+  const basisCents = Number.isFinite(Number(basisCentsRaw)) ? Number(basisCentsRaw) : merchCents;
 
   let best = null;
+
+  const rates = [];
 
   // First match wins (charts already sorted by priority desc)
   for (const chart of charts) {
@@ -174,28 +200,24 @@ export async function action({ request }) {
         chart?.handlingFeeCents ?? 0
       );
 
-      best = {
-        service_name: tier.name,
-        service_code: tier.serviceCode ?? tier.id,
+      rates.push({
+        service_name: chart.name,
+        service_code: `${chart.id}:${tier.id}`,
         priceCents,
-      };
+      });
       break;
     }
-    if (best) break;
   }
 
   // Fail closed if no tier matched
-  if (!best) return json({ rates: [] });
+  if (rates.length === 0) return json({ rates: [] });
 
   return json({
-    rates: [
-      {
-        service_name: best.service_name,
-        service_code: String(best.service_code),
-        total_price: String(best.priceCents),
-        currency: payload?.rate?.currency || "USD",
-        description: `Pre-discount merchandise: $${(merchCents / 100).toFixed(2)}`,
-      },
-    ],
+    rates: rates.map((r) => ({
+      service_name: r.service_name,
+      service_code: r.service_code,
+      total_price: String(r.priceCents),
+      currency: "USD",
+    })),
   });
 }
