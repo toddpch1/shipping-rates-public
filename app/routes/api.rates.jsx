@@ -1,8 +1,9 @@
 // app/routes/api.rates.jsx
 import crypto from "crypto";
 import prisma from "../db.server";
-import { loadVolumePricingForShop } from "../lib/pricing/volumePricingProvider.server";
-import { computeVolumeAdjustedMerchCents } from "../lib/pricing/volumePricingEngine.server";
+
+import { loadVolumePricingForShop } from "../lib/volumePricingProvider.server";
+import { computeVolumeAdjustedMerchCents } from "../lib/volumePricingEngine.server";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -15,7 +16,10 @@ function verifyShopifyHmac(rawBody, hmacHeader) {
   if (!hmacHeader) return false;
   const secret = process.env.SHOPIFY_API_SECRET;
   if (!secret) throw new Error("Missing SHOPIFY_API_SECRET env var");
-  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
+  const digest = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody, "utf8")
+    .digest("base64");
   try {
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
   } catch {
@@ -50,7 +54,6 @@ function isDestinationManaged(managedZoneConfig, destCountry, destProvince) {
   const cc = normalizeCountryCode(destCountry);
   const pc = normalizeProvinceCode(destProvince);
 
-  // Same split as Settings UI
   const isNA = cc === "US" || cc === "CA" || cc === "MX";
   const groupKey = isNA ? "northAmerica" : "international";
 
@@ -58,7 +61,6 @@ function isDestinationManaged(managedZoneConfig, destCountry, destProvince) {
   const entry = countries?.[cc];
   if (!entry) return false;
 
-  // Country-level selection
   if (entry?.selected === true) return true;
 
   const provs = Array.isArray(entry?.provinces)
@@ -66,9 +68,7 @@ function isDestinationManaged(managedZoneConfig, destCountry, destProvince) {
     : [];
   if (provs.length === 0) return false;
 
-  // If Shopify doesn’t send a province, be safe: treat as unmanaged
   if (!pc) return false;
-
   return provs.includes(pc);
 }
 
@@ -80,15 +80,6 @@ function computeTierPriceCents(tier, basisCents, handlingFeeCents = 0) {
 
   // Locked behavior: chart-level handlingFeeCents added after tier math
   return tierRateCents + (handlingFeeCents ?? 0);
-}
-
-function safeJsonParse(str, fallback) {
-  try {
-    if (typeof str !== "string") return fallback;
-    return JSON.parse(str);
-  } catch {
-    return fallback;
-  }
 }
 
 export async function action({ request }) {
@@ -106,7 +97,6 @@ export async function action({ request }) {
   try {
     payload = JSON.parse(rawBody);
   } catch {
-    // Fail closed: no rates
     return json({ rates: [] });
   }
 
@@ -115,36 +105,45 @@ export async function action({ request }) {
 
   // Shipping basis (locked):
   // merchandise subtotal AFTER Volume Pricing only; ignore promo/discount-code discounts.
-  // In carrier payload, item.price is integer cents and is the best available
-  // "ignore promo discounts" signal (do NOT use discounted_price / total_price).
+  // In carrier payload, item.price is integer cents; do NOT use order_totals for basis.
   let merchCents = 0;
   for (const item of items) {
     const unitCents = Number(item?.price);
     const qty = Number(item?.quantity || 0);
     if (!Number.isFinite(unitCents) || !Number.isFinite(qty)) {
-      // Fail closed
       return json({ rates: [] });
     }
     merchCents += unitCents * qty;
   }
 
-  // --- Managed zones gate (locked behavior) ---
+  // Load ShopSettings once
   const shopSettings = await prisma.shopSettings.findUnique({ where: { shop } });
 
-  let managedZoneConfig = safeJsonParse(shopSettings?.managedZoneConfigJson, null);
+  // Optional managed-zone gate:
+  // - If managedZoneConfigJson is populated, gate.
+  // - If empty/unset, do NOT gate (app returns rates everywhere).
+  let managedZoneConfig = null;
+  try {
+    managedZoneConfig = shopSettings?.managedZoneConfigJson
+      ? JSON.parse(shopSettings.managedZoneConfigJson)
+      : null;
+  } catch {
+    managedZoneConfig = null;
+  }
 
   const dest = payload?.rate?.destination || {};
   const destCountry = dest.country_code || dest.country || "";
   const destProvince = dest.province_code || dest.province || "";
 
-  // Outside managed zones => [] so Shopify/manual rates apply (locked)
-  if (!isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
-    return json({ rates: [] });
+  if (managedZoneConfig?.groups) {
+    if (!isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
+      return json({ rates: [] });
+    }
   }
 
-  // --- Apply cached Volume Pricing (NO Shopify calls) ---
+  // Apply cached Volume Pricing (NO Shopify calls)
   let basisCents = merchCents;
-  let volumeMeta = null;
+  let volDebug = null;
 
   try {
     const { config, eligibilitySnapshot } = await loadVolumePricingForShop(shop);
@@ -155,14 +154,12 @@ export async function action({ request }) {
       hardItemCap: 500,
     });
 
-    // If provider/eligibility missing, engine returns safe fallbacks
-    if (result?.ok === true) {
+    if (result?.ok === true && Number.isFinite(result.volumeAdjustedMerchCents)) {
       basisCents = result.volumeAdjustedMerchCents;
-      volumeMeta = result;
+      volDebug = result;
     }
   } catch {
-    // Safe: keep basisCents = merchCents
-    volumeMeta = { ok: false, error: "volume_pricing_failed_safe_fallback" };
+    // Safe fallback: keep basisCents = merchCents
   }
 
   const charts = await prisma.shippingChart.findMany({
@@ -176,55 +173,53 @@ export async function action({ request }) {
     orderBy: { priority: "desc" },
   });
 
-  let best = null;
+  const descParts = [];
+  // Keep your helpful debug line if you want; comment out if not needed:
+  descParts.push(`Merch (payload): $${(merchCents / 100).toFixed(2)}`);
+  descParts.push(`Basis after vol: $${(basisCents / 100).toFixed(2)}`);
+  if (volDebug?.appliedTier?.minEligibleQty) {
+    const off = (Number(volDebug.appliedTier.discountCentsEach || 0) / 100).toFixed(2);
+    descParts.push(
+      `Vol tier: ${volDebug.appliedTier.minEligibleQty}+ → -$${off}/ea`
+    );
+    descParts.push(`Eligible qty: ${Number(volDebug.eligibleQty || 0)}`);
+  }
 
-  // First match wins (charts already sorted by priority desc)
+  // Return ONE rate per active chart
+  const rates = [];
   for (const chart of charts) {
+    let matchedTier = null;
+
     for (const tier of chart.tiers) {
       if (!isBetween(basisCents, tier.minCents, tier.maxCents)) continue;
-
-      const priceCents = computeTierPriceCents(
-        tier,
-        basisCents,
-        chart?.handlingFeeCents ?? 0
-      );
-
-      best = {
-        service_name: tier.name,
-        service_code: tier.serviceCode ?? tier.id,
-        priceCents,
-      };
+      matchedTier = tier;
       break;
     }
-    if (best) break;
-  }
+    if (!matchedTier) continue;
 
-  // Fail closed if no tier matched
-  if (!best) return json({ rates: [] });
-
-  const descParts = [
-    `Merch (payload): $${(merchCents / 100).toFixed(2)}`,
-    `Basis after volume: $${(basisCents / 100).toFixed(2)}`,
-  ];
-
-  if (volumeMeta?.appliedTier) {
-    descParts.push(
-      `Vol tier: ${volumeMeta.appliedTier.minEligibleQty}+ => -$${(
-        volumeMeta.appliedTier.discountCentsEach / 100
-      ).toFixed(2)}/ea`
+    const priceCents = computeTierPriceCents(
+      matchedTier,
+      basisCents,
+      chart?.handlingFeeCents ?? 0
     );
-    descParts.push(`Eligible qty: ${volumeMeta.eligibleQty}`);
+
+    rates.push({
+      chartName: chart.name, // fixes “Standard” issue
+      chartId: chart.id,
+      tierName: matchedTier.name,
+      priceCents,
+    });
   }
+
+  if (rates.length === 0) return json({ rates: [] });
 
   return json({
-    rates: [
-      {
-        service_name: best.service_name,
-        service_code: String(best.service_code),
-        total_price: String(best.priceCents),
-        currency: payload?.rate?.currency || "USD",
-        description: descParts.join(" • "),
-      },
-    ],
+    rates: rates.map((r) => ({
+      service_name: r.chartName,
+      service_code: String(r.chartId),
+      total_price: String(r.priceCents),
+      currency: payload?.rate?.currency || "USD",
+      description: [...descParts, `Tier: ${r.tierName}`].join(" • "),
+    })),
   });
 }

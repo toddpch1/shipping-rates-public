@@ -1,5 +1,5 @@
 // app/lib/pricing/volumePricingProvider.server.js
-import prisma from "../../db.server";
+import prisma from "../db.server";
 
 function safeJsonParse(str, fallback) {
   try {
