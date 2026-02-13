@@ -1,5 +1,8 @@
+// app/routes/api.rates.jsx
 import crypto from "crypto";
 import prisma from "../db.server";
+import { loadVolumePricingForShop } from "../lib/pricing/volumePricingProvider.server";
+import { computeVolumeAdjustedMerchCents } from "../lib/pricing/volumePricingEngine.server";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -10,15 +13,9 @@ function json(data, status = 200) {
 
 function verifyShopifyHmac(rawBody, hmacHeader) {
   if (!hmacHeader) return false;
-
   const secret = process.env.SHOPIFY_API_SECRET;
   if (!secret) throw new Error("Missing SHOPIFY_API_SECRET env var");
-
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody, "utf8")
-    .digest("base64");
-
+  const digest = crypto.createHmac("sha256", secret).update(rawBody, "utf8").digest("base64");
   try {
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
   } catch {
@@ -35,7 +32,6 @@ function isBetween(value, minCents, maxCents) {
 function normalizeProvinceCode(p) {
   return String(p || "").trim().toUpperCase();
 }
-
 function normalizeCountryCode(c) {
   return String(c || "").trim().toUpperCase();
 }
@@ -45,7 +41,7 @@ function normalizeCountryCode(c) {
  * {
  *   groups: {
  *     northAmerica: { countries: { US:{provinces:["CO",...]}, CA:{...} } },
- *     international: { countries: { GB:{selected:true}, ... } }
+ *     international:{ countries: { GB:{selected:true}, ... } }
  *   }
  * }
  */
@@ -68,7 +64,6 @@ function isDestinationManaged(managedZoneConfig, destCountry, destProvince) {
   const provs = Array.isArray(entry?.provinces)
     ? entry.provinces.map(normalizeProvinceCode)
     : [];
-
   if (provs.length === 0) return false;
 
   // If Shopify doesn’t send a province, be safe: treat as unmanaged
@@ -81,16 +76,24 @@ function computeTierPriceCents(tier, basisCents, handlingFeeCents = 0) {
   const tierRateCents =
     tier.priceType === "PERCENT_OF_BASIS"
       ? Math.round((basisCents * (tier.percentBps ?? 0)) / 10000)
-      : (tier.flatPriceCents ?? 0);
+      : tier.flatPriceCents ?? 0;
 
   // Locked behavior: chart-level handlingFeeCents added after tier math
   return tierRateCents + (handlingFeeCents ?? 0);
 }
 
+function safeJsonParse(str, fallback) {
+  try {
+    if (typeof str !== "string") return fallback;
+    return JSON.parse(str);
+  } catch {
+    return fallback;
+  }
+}
+
 export async function action({ request }) {
   const rawBody = await request.clone().text();
   const hmac = request.headers.get("x-shopify-hmac-sha256");
-
   if (!verifyShopifyHmac(rawBody, hmac)) {
     return new Response("Invalid HMAC", { status: 401 });
   }
@@ -102,73 +105,64 @@ export async function action({ request }) {
   let payload;
   try {
     payload = JSON.parse(rawBody);
-    console.log("[/api/rates] keys", Object.keys(payload || {}));
-    console.log("[/api/rates] rate keys", Object.keys(payload?.rate || {}));
-    console.log("[/api/rates] first item sample", JSON.stringify(payload?.rate?.items?.[0] ?? null, null, 2));
-    console.log("[/api/rates] discounts sample", JSON.stringify(payload?.rate?.discounts ?? payload?.rate?.applied_discounts ?? null, null, 2));
-    console.log("[/api/rates] order_totals", JSON.stringify(payload?.rate?.order_totals ?? null, null, 2));
   } catch {
     // Fail closed: no rates
     return json({ rates: [] });
   }
 
   const items = (payload?.rate?.items ?? []).filter((i) => i.requires_shipping);
-  // DEBUG: inspect carrier payload item fields (remove once confirmed)
-const first = payload?.rate?.items?.[0] ?? null;
-if (first) {
-  console.log("[/api/rates] first item keys", Object.keys(first));
-  console.log("[/api/rates] first item price fields", {
-    price: first.price,
-    discounted_price: first.discounted_price,
-    line_price: first.line_price,
-    total_price: first.total_price,
-    original_line_price: first.original_line_price,
-    original_price: first.original_price,
-  });
-}
-console.log("[/api/rates] order_totals", payload?.rate?.order_totals);
-
   if (items.length === 0) return json({ rates: [] });
 
   // Shipping basis (locked):
-  // pre-discount merchandise subtotal AFTER Volume Pricing only.
-  // In carrier-service payload, item.price is integer cents and is the best available
+  // merchandise subtotal AFTER Volume Pricing only; ignore promo/discount-code discounts.
+  // In carrier payload, item.price is integer cents and is the best available
   // "ignore promo discounts" signal (do NOT use discounted_price / total_price).
   let merchCents = 0;
   for (const item of items) {
     const unitCents = Number(item?.price);
     const qty = Number(item?.quantity || 0);
-
     if (!Number.isFinite(unitCents) || !Number.isFinite(qty)) {
       // Fail closed
       return json({ rates: [] });
     }
-
     merchCents += unitCents * qty;
   }
 
-  // --- Managed zones gate ---
-  // TEMP: disable gate while Settings are paused so we can validate tier math + Shopify shipping discounts.
-  // When you re-enable managed zones later, flip this to true.
-  const ENABLE_MANAGED_ZONE_GATE = false;
+  // --- Managed zones gate (locked behavior) ---
   const shopSettings = await prisma.shopSettings.findUnique({ where: { shop } });
 
-  let managedZoneConfig = null;
-  try {
-    managedZoneConfig = shopSettings?.managedZoneConfigJson
-      ? JSON.parse(shopSettings.managedZoneConfigJson)
-      : null;
-  } catch {
-    managedZoneConfig = null;
-  }
+  let managedZoneConfig = safeJsonParse(shopSettings?.managedZoneConfigJson, null);
 
   const dest = payload?.rate?.destination || {};
   const destCountry = dest.country_code || dest.country || "";
   const destProvince = dest.province_code || dest.province || "";
 
   // Outside managed zones => [] so Shopify/manual rates apply (locked)
-  if (ENABLE_MANAGED_ZONE_GATE && !isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
+  if (!isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
     return json({ rates: [] });
+  }
+
+  // --- Apply cached Volume Pricing (NO Shopify calls) ---
+  let basisCents = merchCents;
+  let volumeMeta = null;
+
+  try {
+    const { config, eligibilitySnapshot } = await loadVolumePricingForShop(shop);
+    const result = computeVolumeAdjustedMerchCents({
+      items,
+      config,
+      eligibilitySnapshot,
+      hardItemCap: 500,
+    });
+
+    // If provider/eligibility missing, engine returns safe fallbacks
+    if (result?.ok === true) {
+      basisCents = result.volumeAdjustedMerchCents;
+      volumeMeta = result;
+    }
+  } catch {
+    // Safe: keep basisCents = merchCents
+    volumeMeta = { ok: false, error: "volume_pricing_failed_safe_fallback" };
   }
 
   const charts = await prisma.shippingChart.findMany({
@@ -182,12 +176,7 @@ console.log("[/api/rates] order_totals", payload?.rate?.order_totals);
     orderBy: { priority: "desc" },
   });
 
-  const basisCentsRaw = payload?.rate?.order_totals?.total_price;
-  const basisCents = Number.isFinite(Number(basisCentsRaw)) ? Number(basisCentsRaw) : merchCents;
-
   let best = null;
-
-  const rates = [];
 
   // First match wins (charts already sorted by priority desc)
   for (const chart of charts) {
@@ -200,24 +189,42 @@ console.log("[/api/rates] order_totals", payload?.rate?.order_totals);
         chart?.handlingFeeCents ?? 0
       );
 
-      rates.push({
-        service_name: chart.name,
-        service_code: `${chart.id}:${tier.id}`,
+      best = {
+        service_name: tier.name,
+        service_code: tier.serviceCode ?? tier.id,
         priceCents,
-      });
+      };
       break;
     }
+    if (best) break;
   }
 
   // Fail closed if no tier matched
-  if (rates.length === 0) return json({ rates: [] });
+  if (!best) return json({ rates: [] });
+
+  const descParts = [
+    `Merch (payload): $${(merchCents / 100).toFixed(2)}`,
+    `Basis after volume: $${(basisCents / 100).toFixed(2)}`,
+  ];
+
+  if (volumeMeta?.appliedTier) {
+    descParts.push(
+      `Vol tier: ${volumeMeta.appliedTier.minEligibleQty}+ => -$${(
+        volumeMeta.appliedTier.discountCentsEach / 100
+      ).toFixed(2)}/ea`
+    );
+    descParts.push(`Eligible qty: ${volumeMeta.eligibleQty}`);
+  }
 
   return json({
-    rates: rates.map((r) => ({
-      service_name: r.service_name,
-      service_code: r.service_code,
-      total_price: String(r.priceCents),
-      currency: "USD",
-    })),
+    rates: [
+      {
+        service_name: best.service_name,
+        service_code: String(best.service_code),
+        total_price: String(best.priceCents),
+        currency: payload?.rate?.currency || "USD",
+        description: descParts.join(" • "),
+      },
+    ],
   });
 }

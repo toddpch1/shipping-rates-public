@@ -121,6 +121,12 @@ model ShippingSelector {
   @@index([chartId, type])
 }
 model ShopSettings {
+    /// Volume pricing config (normalized, JSON)
+  volumePricingConfigJson String @default("{}")
+
+  /// Cached eligibility snapshot (product IDs, exclusions, JSON)
+  volumeEligibilitySnapshotJson String @default("{}")
+
   id String @id @default(cuid())
 
   /// Shopify shop domain
@@ -148,5 +154,20 @@ model ShopSettings {
   updatedAt DateTime @updatedAt
 
   managedServiceIdsJson String? @default("[]")
+  /// Volume Pricing: label to match against automatic discounts (case-insensitive contains)
+  volumeDiscountLabel String @default("Volume Pricing")
+
+  /// Cached parsed snapshot of volume pricing rules (JSON string)
+  volumePricingSnapshotJson String @default("{}")
+
+  /// Snapshot schema version
+  volumePricingSnapshotVersion Int @default(1)
+
+  /// Last successful volume pricing sync time
+  volumePricingLastSyncedAt DateTime?
+
+  /// Last volume pricing sync error
+  volumePricingLastSyncError String?
+
 }
 
