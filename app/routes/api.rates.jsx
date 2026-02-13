@@ -40,38 +40,6 @@ function normalizeCountryCode(c) {
   return String(c || "").trim().toUpperCase();
 }
 
-/**
- * managedZoneConfigJson shape (from Settings):
- * {
- *   groups: {
- *     northAmerica: { countries: { US:{provinces:["CO",...]}, CA:{...} } },
- *     international:{ countries: { GB:{selected:true}, ... } }
- *   }
- * }
- */
-function isDestinationManaged(managedZoneConfig, destCountry, destProvince) {
-  const cfg = managedZoneConfig?.groups || {};
-  const cc = normalizeCountryCode(destCountry);
-  const pc = normalizeProvinceCode(destProvince);
-
-  const isNA = cc === "US" || cc === "CA" || cc === "MX";
-  const groupKey = isNA ? "northAmerica" : "international";
-
-  const countries = cfg?.[groupKey]?.countries || {};
-  const entry = countries?.[cc];
-  if (!entry) return false;
-
-  if (entry?.selected === true) return true;
-
-  const provs = Array.isArray(entry?.provinces)
-    ? entry.provinces.map(normalizeProvinceCode)
-    : [];
-  if (provs.length === 0) return false;
-
-  if (!pc) return false;
-  return provs.includes(pc);
-}
-
 function computeTierPriceCents(tier, basisCents, handlingFeeCents = 0) {
   const tierRateCents =
     tier.priceType === "PERCENT_OF_BASIS"
@@ -134,12 +102,6 @@ export async function action({ request }) {
   const dest = payload?.rate?.destination || {};
   const destCountry = dest.country_code || dest.country || "";
   const destProvince = dest.province_code || dest.province || "";
-
-  if (managedZoneConfig?.groups) {
-    if (!isDestinationManaged(managedZoneConfig, destCountry, destProvince)) {
-      return json({ rates: [] });
-    }
-  }
 
   // Apply cached Volume Pricing (NO Shopify calls)
   let basisCents = merchCents;
