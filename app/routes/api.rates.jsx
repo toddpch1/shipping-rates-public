@@ -37,6 +37,26 @@ function normalizeProvinceCode(p) {
   return String(p || "").trim().toUpperCase();
 }
 function normalizeCountryCode(c) {
+  function getPayableMerchCentsFromPayload(payload) {
+    // Shopify "payable" (discounted) subtotal. Used only as fallback if volume-basis fails.
+    const r = payload?.rate || {};
+    const candidates = [
+      r?.order_total,
+      r?.order_total_price,
+      r?.order_totals?.total_price,
+      r?.order_totals?.order_total,
+      r?.order_totals?.subtotal_price,
+      r?.subtotal_price,
+      r?.total_price,
+    ];
+
+    for (const v of candidates) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return null;
+  }
+
   return String(c || "").trim().toUpperCase();
 }
 
@@ -83,7 +103,7 @@ export async function action({ request }) {
     }
     merchCents += unitCents * qty;
   }
-
+  const payableBasisCents = getPayableMerchCentsFromPayload(payload);
   // Load ShopSettings once
   const shopSettings = await prisma.shopSettings.findUnique({ where: { shop } });
 
@@ -121,7 +141,11 @@ export async function action({ request }) {
       volDebug = result;
     }
   } catch {
-    // Safe fallback: keep basisCents = merchCents
+    // Fallback to Shopify payable (discounted) subtotal, but still use OUR tiers.
+    if (Number.isFinite(payableBasisCents)) {
+      basisCents = payableBasisCents;
+      volDebug = { ok: false, error: "volume_pricing_failed_payable_fallback" };
+    }
   }
 
   const charts = await prisma.shippingChart.findMany({
